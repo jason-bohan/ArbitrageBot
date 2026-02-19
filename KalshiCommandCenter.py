@@ -13,9 +13,19 @@ from textual.containers import Horizontal, Vertical
 from datetime import datetime
 from textual.worker import Worker
 from kalshi_connection import get_kalshi_headers as conn_get_kalshi_headers, test_connection
+from bot_state import load_state, save_state
 
 # 1. Load Environment Variables
 load_dotenv()
+
+# Map of bot keys to script filenames (expected in project root)
+BOT_SCRIPTS = {
+    "credit_spread": "KalshiCreditSpread.py",
+    "iron_condor": "KalshiIronCondor.py",
+    "pairs": "KalshiPairs.py",
+    "scanner": "KalshiScanner.py",
+    "profit_maximizer": "ProfitMaximizer.py",
+}
 
 class KalshiDashboard(App):
     """Command Center V5.0: Integrated Wallet & Sniper."""
@@ -43,10 +53,18 @@ class KalshiDashboard(App):
                 yield Button("Refresh All", id="btn_refresh", variant="primary")
                 yield Button("Start Trend Sniper", id="btn_snipe", variant="success")
                 yield Button("Stop All Bots", id="btn_stop", variant="error")
+            with Vertical(classes="box"):
+                yield Label("🤖 BOTS CONTROL")
+                # buttons for each bot
+                for key, script in BOT_SCRIPTS.items():
+                    pretty = script.replace('.py', '').replace('Kalshi', '').replace('_', ' ').strip()
+                    yield Button(f"Start {pretty}", id=f"start_{key}", variant="primary")
+                    yield Button(f"Stop {pretty}", id=f"stop_{key}", variant="error")
             
             with Vertical(classes="box"):
                 yield Label("📊 POSITION MONITOR")
                 yield DataTable(id="trades_table")
+                yield DataTable(id="bots_table")
                 yield Log(id="main_log")
         yield Footer()
 
@@ -62,6 +80,24 @@ class KalshiDashboard(App):
         self.run_worker(self._sync_worker, thread=True)
         # Schedule background runs by passing the callable (do not call it here)
         self.set_interval(10, lambda: self.run_worker(self._sync_worker, thread=True))
+
+        # Bot process management
+        self.bots: dict[str, subprocess.Popen] = {}
+        bots_table = self.query_one("#bots_table", DataTable)
+        bots_table.add_columns("Bot", "Status", "PID")
+        # populate initial table
+        self.update_bots_table()
+        # restore saved bot state (start bots that were running)
+        try:
+            saved = load_state()
+            for key, running in saved.items():
+                if running and key in BOT_SCRIPTS:
+                    self.log_message(f"🔁 Restoring bot: {key}")
+                    self.start_bot(key)
+        except Exception:
+            pass
+        # refresh bot status regularly
+        self.set_interval(5, self.update_bots_table)
 
     def _update_balance_panel(self, text: str):
         """Thread-safe way to update balance panel."""
@@ -93,6 +129,107 @@ class KalshiDashboard(App):
             error_msg = f"❌ {type(e).__name__}: {str(e)[:40]}"
             self.call_from_thread(self.log_message, error_msg)
 
+    # ---- Bot process control ----
+    def start_bot(self, key: str) -> None:
+        """Start a bot script if not already running."""
+        if key not in BOT_SCRIPTS:
+            self.log_message(f"❌ Unknown bot key: {key}")
+            return
+
+        if key in self.bots:
+            proc = self.bots[key]
+            if proc.poll() is None:
+                self.log_message(f"⚠️ Bot {key} already running (PID {proc.pid})")
+                return
+
+        script = BOT_SCRIPTS[key]
+        script_path = os.path.join(os.getcwd(), script)
+        try:
+            proc = subprocess.Popen([self.python_exe, script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.bots[key] = proc
+            self.log_message(f"🚀 Started {script} (PID {proc.pid})")
+            self.update_bots_table()
+            # persist state
+            try:
+                st = load_state()
+                st[key] = True
+                save_state(st)
+            except Exception:
+                pass
+        except Exception as e:
+            self.log_message(f"❌ Failed to start {script}: {e}")
+
+    def stop_bot(self, key: str) -> None:
+        """Stop a running bot by key."""
+        proc = self.bots.get(key)
+        if not proc:
+            self.log_message(f"⚠️ Bot {key} not running")
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+            self.log_message(f"🛑 Stopped {key} (PID {proc.pid})")
+        except Exception:
+            try:
+                proc.kill()
+                self.log_message(f"💀 Killed {key} (PID {proc.pid})")
+            except Exception as e:
+                self.log_message(f"❌ Failed to stop {key}: {e}")
+        finally:
+            self.bots.pop(key, None)
+            self.update_bots_table()
+            # persist state
+            try:
+                st = load_state()
+                st[key] = False
+                save_state(st)
+            except Exception:
+                pass
+
+    def stop_all_bots(self) -> None:
+        # show confirmation dialog (non-blocking) — user must confirm
+        self.show_stop_confirmation()
+
+    def show_stop_confirmation(self) -> None:
+        """Mount a simple confirmation box with Confirm/Cancel buttons."""
+        if getattr(self, "_stop_confirm_visible", False):
+            return
+        self._stop_confirm_visible = True
+        confirm = Static("Are you sure you want to stop ALL bots?", id="stop_confirm")
+        # small action buttons
+        confirm_button = Button("Confirm Stop All", id="confirm_stop", variant="error")
+        cancel_button = Button("Cancel", id="cancel_stop", variant="primary")
+        # mount container
+        wrapper = Vertical(confirm, confirm_button, cancel_button, id="stop_confirm_wrapper")
+        self.mount(wrapper)
+
+    def hide_stop_confirmation(self) -> None:
+        try:
+            node = self.query_one("#stop_confirm_wrapper")
+            node.remove()
+        except Exception:
+            pass
+        self._stop_confirm_visible = False
+
+    def stop_all_bots_confirmed(self) -> None:
+        keys = list(self.bots.keys())
+        for k in keys:
+            self.stop_bot(k)
+        self.hide_stop_confirmation()
+
+    def update_bots_table(self) -> None:
+        bots_table = self.query_one("#bots_table", DataTable)
+        bots_table.clear(columns=False)
+        for key, script in BOT_SCRIPTS.items():
+            proc = self.bots.get(key)
+            if proc and proc.poll() is None:
+                status = "running"
+                pid = str(proc.pid)
+            else:
+                status = "stopped"
+                pid = "-"
+            bots_table.add_row(script, status, pid)
+
     def log_message(self, message: str):
         self.query_one("#main_log", Log).write_line(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
@@ -112,16 +249,30 @@ class KalshiDashboard(App):
 
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn_refresh":
+        bid = event.button.id
+        if bid == "btn_refresh":
             self.log_message("🔄 Manual sync triggered...")
             # Run the sync worker in a separate thread (do not call the function)
             self.run_worker(self._sync_worker, thread=True)
-        elif event.button.id == "btn_snipe":
-            subprocess.Popen([self.python_exe, "KalshiScanner.py"])
-            self.log_message("🚀 Sniper Bot Dispatched.")
-        elif event.button.id == "btn_stop":
-            os.system("pkill -f python")
-            self.log_message("🛑 Emergency Stop Executed.")
+        elif bid == "btn_snipe":
+            # start scanner bot via managed start
+            self.start_bot("scanner")
+        elif bid == "btn_stop":
+            # graceful stop all managed bots — show confirmation
+            self.log_message("🛑 Stop All requested — showing confirmation...")
+            self.stop_all_bots()
+        elif bid and bid.startswith("start_"):
+            key = bid.split("start_", 1)[1]
+            self.start_bot(key)
+        elif bid and bid.startswith("stop_"):
+            key = bid.split("stop_", 1)[1]
+            self.stop_bot(key)
+        elif bid == "confirm_stop":
+            self.log_message("🛑 Confirmed stop all — stopping now")
+            self.stop_all_bots_confirmed()
+        elif bid == "cancel_stop":
+            self.log_message("✖️ Cancelled Stop All")
+            self.hide_stop_confirmation()
 
 if __name__ == "__main__":
     KalshiDashboard().run()
