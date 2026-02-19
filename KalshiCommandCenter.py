@@ -12,6 +12,7 @@ from textual.widgets import Header, Footer, Static, Button, Log, Label, DataTabl
 from textual.containers import Horizontal, Vertical
 from datetime import datetime
 from textual.worker import Worker
+from kalshi_connection import get_kalshi_headers as conn_get_kalshi_headers, test_connection
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -55,8 +56,12 @@ class KalshiDashboard(App):
         table.add_columns("Ticker", "Qty", "Target", "Side", "Outcome")
         
         self.log_message("System V5.0 Online. Initializing Sync...")
-        self.run_worker(self._sync_worker())
-        self.set_interval(10, lambda: self.run_worker(self._sync_worker()))
+        # Run a quick connection test in a threaded worker for debug
+        self.run_worker(test_connection, thread=True)
+        # Run the sync worker in a threaded worker (non-async function)
+        self.run_worker(self._sync_worker, thread=True)
+        # Schedule background runs by passing the callable (do not call it here)
+        self.set_interval(10, lambda: self.run_worker(self._sync_worker, thread=True))
 
     def _update_balance_panel(self, text: str):
         """Thread-safe way to update balance panel."""
@@ -67,7 +72,8 @@ class KalshiDashboard(App):
         try:
             # Sync Balance
             b_path = "/trade-api/v2/portfolio/balance"
-            url = "https://trading-api.kalshi.com" + b_path
+            base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+            url = base_url + b_path
             
             res = requests.get(url, headers=self.get_kalshi_headers("GET", b_path), timeout=2)
             
@@ -91,22 +97,25 @@ class KalshiDashboard(App):
         self.query_one("#main_log", Log).write_line(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
     def get_kalshi_headers(self, method, path):
-        """Helper to sign Kalshi requests."""
-        api_key = os.getenv("KALSHI_API_KEY_ID")
-        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
-        with open(key_path, "rb") as f:
-            p_key = serialization.load_pem_private_key(f.read(), password=None)
-        ts = str(int(time.time() * 1000))
-        msg = ts + method + path
-        sig = base64.b64encode(p_key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())).decode()
-        return {"KALSHI-ACCESS-KEY": api_key, "KALSHI-ACCESS-SIGNATURE": sig, "KALSHI-ACCESS-TIMESTAMP": ts}
+        """Wrapper that delegates header construction to `kalshi_connection.get_kalshi_headers`.
+
+        This centralizes auth logic so you can run `kalshi_connection.test_connection()`
+        independently for debugging.
+        """
+        try:
+            return conn_get_kalshi_headers(method, path)
+        except Exception as e:
+            # Surface header-building errors in the UI log for easier debugging
+            self.log_message(f"❌ Header build error: {e}")
+            raise
 
 
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn_refresh":
             self.log_message("🔄 Manual sync triggered...")
-            self.run_worker(self._sync_worker())
+            # Run the sync worker in a separate thread (do not call the function)
+            self.run_worker(self._sync_worker, thread=True)
         elif event.button.id == "btn_snipe":
             subprocess.Popen([self.python_exe, "KalshiScanner.py"])
             self.log_message("🚀 Sniper Bot Dispatched.")
