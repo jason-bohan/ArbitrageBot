@@ -1,3 +1,4 @@
 {
-  "scanner": false
+  "scanner": false,
+  "profit_maximizer": false
 }
