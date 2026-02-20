@@ -38,6 +38,10 @@ class KalshiDashboard(App):
         content-align: center middle; text-style: bold;
         border: double #9ece6a; margin: 1;
     }
+    #status-strip {
+        height: 1; background: #0f1720; color: #c0caf5;
+        content-align: left middle; padding-left: 1; border: solid #414868;
+    }
     DataTable { height: 12; background: #24283b; border: solid #bb9af7; color: white; }
     Button { width: 100%; margin-bottom: 1; height: 3; }
     Label { text-style: bold; margin-bottom: 0; color: #f7768e; }
@@ -64,9 +68,17 @@ class KalshiDashboard(App):
             with Vertical(classes="box"):
                 yield Label("📊 POSITION MONITOR")
                 yield DataTable(id="trades_table")
+                # Sorting controls for bots table
+                with Horizontal(id="bots_controls"):
+                    yield Button("Sort: Bot", id="sort_bot", variant="primary")
+                    yield Button("Sort: Status", id="sort_status", variant="primary")
+                    yield Button("Sort: PID", id="sort_pid", variant="primary")
                 yield DataTable(id="bots_table")
+                # Per-row action buttons (Start/Stop) will be rendered here
+                yield Vertical(id="bots_actions")
                 yield Log(id="main_log")
-        yield Footer()
+            yield Static("Ready", id="status-strip")
+            yield Footer()
 
     def on_mount(self) -> None:
         self.python_exe = sys.executable
@@ -85,6 +97,8 @@ class KalshiDashboard(App):
         self.bots: dict[str, subprocess.Popen] = {}
         bots_table = self.query_one("#bots_table", DataTable)
         bots_table.add_columns("Bot", "Status", "PID")
+        # sort state: (column_key, reverse)
+        self._bots_sort = ("bot", False)
         # populate initial table
         self.update_bots_table()
         # restore saved bot state (start bots that were running)
@@ -98,6 +112,11 @@ class KalshiDashboard(App):
             pass
         # refresh bot status regularly
         self.set_interval(5, self.update_bots_table)
+        # initialize status strip
+        try:
+            self.query_one("#status-strip", Static).update("Ready")
+        except Exception:
+            pass
 
     def _update_balance_panel(self, text: str):
         """Thread-safe way to update balance panel."""
@@ -220,6 +239,8 @@ class KalshiDashboard(App):
     def update_bots_table(self) -> None:
         bots_table = self.query_one("#bots_table", DataTable)
         bots_table.clear(columns=False)
+        # Build rows and sort according to current sort state
+        rows = []
         for key, script in BOT_SCRIPTS.items():
             proc = self.bots.get(key)
             if proc and proc.poll() is None:
@@ -228,10 +249,49 @@ class KalshiDashboard(App):
             else:
                 status = "stopped"
                 pid = "-"
+            rows.append((key, script, status, pid))
+
+        col_key, reverse = self._bots_sort
+        if col_key == "bot":
+            rows.sort(key=lambda r: r[1].lower(), reverse=reverse)
+        elif col_key == "status":
+            rows.sort(key=lambda r: r[2], reverse=reverse)
+        elif col_key == "pid":
+            # sort by pid numeric where possible
+            def pid_key(r):
+                try:
+                    return int(r[3]) if r[3].isdigit() else (-1 if r[3] == "-" else 0)
+                except Exception:
+                    return -1
+            rows.sort(key=pid_key, reverse=reverse)
+
+        for key, script, status, pid in rows:
             bots_table.add_row(script, status, pid)
+
+        # Update per-row action buttons container
+        try:
+            actions = self.query_one("#bots_actions", Vertical)
+            # clear existing
+            for child in list(actions.children):
+                child.remove()
+            for key, script, status, pid in rows:
+                pretty = script.replace('.py', '').replace('Kalshi', '').replace('_', ' ').strip()
+                if status == "running":
+                    b = Button(f"Stop {pretty}", id=f"row_stop_{key}", variant="error")
+                else:
+                    b = Button(f"Start {pretty}", id=f"row_start_{key}", variant="primary")
+                actions.mount(b)
+        except Exception:
+            pass
 
     def log_message(self, message: str):
         self.query_one("#main_log", Log).write_line(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        # update status strip with a concise last-action message
+        try:
+            short = message if len(message) <= 80 else message[:77] + "..."
+            self.query_one("#status-strip", Static).update(f"{datetime.now().strftime('%H:%M:%S')} {short}")
+        except Exception:
+            pass
 
     def get_kalshi_headers(self, method, path):
         """Wrapper that delegates header construction to `kalshi_connection.get_kalshi_headers`.
@@ -250,6 +310,18 @@ class KalshiDashboard(App):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
+        # Sorting control handlers
+        if bid in ("sort_bot", "sort_status", "sort_pid"):
+            # toggle sort direction if same column
+            mapping = {"sort_bot": "bot", "sort_status": "status", "sort_pid": "pid"}
+            key = mapping[bid]
+            if self._bots_sort[0] == key:
+                self._bots_sort = (key, not self._bots_sort[1])
+            else:
+                self._bots_sort = (key, False)
+            self.log_message(f"🔀 Sorting bots by {key} (reverse={self._bots_sort[1]})")
+            self.update_bots_table()
+            return
         if bid == "btn_refresh":
             self.log_message("🔄 Manual sync triggered...")
             # Run the sync worker in a separate thread (do not call the function)
