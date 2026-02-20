@@ -4,80 +4,78 @@ import time
 import base64
 import requests
 import uuid
+import signal
+import json
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Static, Button, Log, Label, DataTable
-from textual.containers import Horizontal, Vertical
 from datetime import datetime, timedelta
+from kalshi_connection import get_kalshi_headers
 
 load_dotenv()
 
-class KalshiDashboard(App):
-    """Command Center V4.3: Fixed Order Routing."""
+class KalshiCreditSpreadBot:
+    """Headless Credit Spread Trading Bot."""
     
-    CSS = """
-    Screen { background: #1a1b26; }
-    .box { height: 100%; border: solid #7aa2f7; margin: 1; padding: 1; }
-    #balance-panel {
-        height: 3; background: #24283b; color: #9ece6a;
-        content-align: center middle; text-style: bold;
-        border: double #9ece6a; margin: 1;
-    }
-    DataTable { height: 12; background: #24283b; border: solid #bb9af7; color: white; }
-    Button { width: 100%; margin-bottom: 1; }
-    Label { text-style: bold; margin-bottom: 0; color: #f7768e; }
-    Log { background: #1a1b26; border: solid #414868; height: 1fr; }
-    """
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static("💰 Syncing Wallet...", id="balance-panel")
-        with Horizontal():
-            with Vertical(classes="box", id="actions-sidebar"):
-                yield Label("🚀 EXECUTION")
-                yield Button("Scan Next Market", id="btn_check", variant="primary")
-                yield Button("BUY 5x CREDIT SPREAD", id="btn_buy", variant="success")
-                yield Button("Stop All Bots", id="btn_stop", variant="error")
-            
-            with Vertical(classes="box"):
-                yield Label("🛡️ BULL CREDIT SPREAD MONITOR")
-                yield DataTable(id="trades_table")
-                yield Label("📜 TRANSACTION LOG")
-                yield Log(id="main_log")
-        yield Footer()
-
-    def on_mount(self) -> None:
+    def __init__(self):
+        self.running = True
+        self.log_file = "credit_spread_bot.log"
+        self.state_file = "credit_spread_state.json"
         self.active_ticker = "KXETH15M-26FEB191230"
-        table = self.query_one("#trades_table", DataTable)
-        table.add_columns("Ticker", "Cushion", "Qty", "Cost", "Time Left")
-        self.log_message("System V4.3 Online. Finding active ETH markets...")
-        self.full_sync()
-        self.set_interval(1, self.update_countdown)
-        self.set_interval(10, self.full_sync)
-
+        
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        self.log_message(f"Received signal {signum}, shutting down...")
+        self.running = False
+        
     def log_message(self, message: str):
-        self.query_one("#main_log", Log).write_line(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-
+        """Log messages to file with timestamp."""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_entry = f"[{timestamp}] {message}\n"
+        
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(log_entry)
+            print(log_entry.strip())  # Also print to console for debugging
+        except Exception as e:
+            print(f"Failed to write to log: {e}")
+    
+    def save_state(self, state_data):
+        """Save bot state to file."""
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(state_data, f, indent=2)
+        except Exception as e:
+            self.log_message(f"Failed to save state: {e}")
+    
+    def load_state(self):
+        """Load bot state from file."""
+        try:
+            with open(self.state_file, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    
     def get_kalshi_headers(self, method, path):
-        api_key = os.getenv("KALSHI_API_KEY_ID")
-        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
-        with open(key_path, "rb") as f:
-            p_key = serialization.load_pem_private_key(f.read(), password=None)
-        ts = str(int(time.time() * 1000))
-        msg = ts + method + path
-        sig = base64.b64encode(p_key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())).decode()
-        return {"KALSHI-ACCESS-KEY": api_key, "KALSHI-ACCESS-SIGNATURE": sig, "KALSHI-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
-
-    def place_order(self):
+        """Get Kalshi API headers with content type for POST requests."""
+        headers = get_kalshi_headers(method, path)
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
+        return headers
+    
+    def place_order(self, count=5):
+        """Place a credit spread order."""
         path = "/trade-api/v2/portfolio/orders"
         url = "https://api.elections.kalshi.com" + path
         
         # Using a Limit Order at 99 cents to ensure it fills but doesn't overpay
         payload = {
             "action": "buy",
-            "count": 5,
+            "count": count,
             "side": "no",
             "ticker": self.active_ticker,
             "type": "limit",
@@ -88,45 +86,123 @@ class KalshiDashboard(App):
         try:
             res = requests.post(url, json=payload, headers=self.get_kalshi_headers("POST", path))
             if res.status_code == 201:
-                self.log_message(f"✅ ORDER PLACED: 5 contracts on {self.active_ticker}")
+                self.log_message(f"✅ ORDER PLACED: {count} contracts on {self.active_ticker}")
+                return True
             else:
                 self.log_message(f"❌ API Error: {res.text}")
+                return False
         except Exception as e:
             self.log_message(f"Order Error: {str(e)}")
-
-    def update_countdown(self):
+            return False
+    
+    def check_balance(self):
+        """Check current account balance."""
+        try:
+            b_path = "/trade-api/v2/portfolio/balance"
+            base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+            url = base_url + b_path
+            res = requests.get(url, headers=get_kalshi_headers("GET", b_path))
+            if res.status_code == 200:
+                balance = res.json().get('balance', 0) / 100
+                return balance
+        except Exception as e:
+            self.log_message(f"Error checking balance: {e}")
+        return None
+    
+    def get_market_data(self, ticker):
+        """Get market data for a specific ticker."""
+        try:
+            url = f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}"
+            res = requests.get(url, headers=get_kalshi_headers("GET", f"/trade-api/v2/markets/{ticker}"))
+            if res.status_code == 200:
+                return res.json().get('market', {})
+        except Exception as e:
+            self.log_message(f"Error getting market data for {ticker}: {e}")
+        return None
+    
+    def calculate_time_to_expiry(self):
+        """Calculate time until next 30-minute mark."""
         now = datetime.now()
         target = now.replace(minute=30, second=0, microsecond=0)
-        if now.minute >= 30: target += timedelta(hours=1)
+        if now.minute >= 30: 
+            target += timedelta(hours=1)
         remaining = target - now
-        time_str = f"{remaining.seconds // 60:02d}:{remaining.seconds % 60:02d}"
-        table = self.query_one("#trades_table", DataTable)
-        if table.row_count > 0:
-            table.update_cell_at((0, 4), f"[b cyan]{time_str}[/]")
-
-    def full_sync(self):
-        table = self.query_one("#trades_table", DataTable)
+        return f"{remaining.seconds // 60:02d}:{remaining.seconds % 60:02d}"
+    
+    def scan_opportunities(self):
+        """Scan for credit spread opportunities."""
         try:
-            # Sync Balance
-            b_path = "/trade-api/v2/portfolio/balance"
-            b_res = requests.get("https://api.elections.kalshi.com" + b_path, headers=self.get_kalshi_headers("GET", b_path))
-            if b_res.status_code == 200:
-                bal = b_res.json().get('balance', 0) / 100
-                self.query_one("#balance-panel", Static).update(f"💳 Wallet: ${bal:.2f}")
-
-            # Update Table
-            table.clear()
-            table.add_row(self.active_ticker, "+$1.58", "0", "62¢", "--:--")
+            # Check balance
+            balance = self.check_balance()
+            if balance is not None:
+                self.log_message(f"Current balance: ${balance:.2f}")
             
+            # Get market data
+            market_data = self.get_market_data(self.active_ticker)
+            if market_data:
+                yes_price = market_data.get('yes_ask', 0)
+                no_price = market_data.get('no_ask', 0)
+                cushion = 100 - (yes_price + no_price)
+                
+                time_left = self.calculate_time_to_expiry()
+                
+                self.log_message(f"Market: {self.active_ticker}")
+                self.log_message(f"Cushion: ${cushion/100:.2f}, Yes: {yes_price}¢, No: {no_price}¢")
+                self.log_message(f"Time to expiry: {time_left}")
+                
+                # Save current state
+                self.save_state({
+                    "last_scan": datetime.now().isoformat(),
+                    "active_ticker": self.active_ticker,
+                    "cushion": cushion,
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                    "balance": balance,
+                    "time_to_expiry": time_left
+                })
+                
+                # Auto-trade logic (optional - can be enabled/disabled)
+                # if cushion > 150:  # If cushion is more than $1.50
+                #     self.log_message("Opportunity detected - placing order...")
+                #     self.place_order()
+                
+            else:
+                self.log_message(f"Failed to get market data for {self.active_ticker}")
+                
         except Exception as e:
-            self.log_message(f"Sync Error: {str(e)[:40]}")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn_buy":
-            self.log_message(f"Sending order for {self.active_ticker}...")
-            self.place_order()
-        elif event.button.id == "btn_stop":
-            os.system("pkill -f python")
+            self.log_message(f"Error in scan_opportunities: {e}")
+    
+    def run(self):
+        """Main bot loop."""
+        self.log_message("Kalshi Credit Spread Bot starting...")
+        self.log_message(f"PID: {os.getpid()}")
+        self.log_message(f"Active ticker: {self.active_ticker}")
+        
+        # Initial scan
+        self.scan_opportunities()
+        
+        # Main loop - scan every 10 seconds, update countdown every second
+        countdown_counter = 0
+        while self.running:
+            try:
+                if countdown_counter % 10 == 0:
+                    self.scan_opportunities()
+                else:
+                    # Just update countdown
+                    time_left = self.calculate_time_to_expiry()
+                    self.log_message(f"Time to expiry: {time_left}")
+                
+                time.sleep(1)
+                countdown_counter += 1
+                
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                self.log_message(f"Error in main loop: {e}")
+                time.sleep(5)  # Wait before retrying
+        
+        self.log_message("Kalshi Credit Spread Bot stopped")
 
 if __name__ == "__main__":
-    KalshiDashboard().run()
+    bot = KalshiCreditSpreadBot()
+    bot.run()

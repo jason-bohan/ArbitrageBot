@@ -1,4 +1,6 @@
 {
   "scanner": false,
-  "profit_maximizer": false
+  "credit_spread": false,
+  "iron_condor": false,
+  "man_target_snipe": true
 }

@@ -1,26 +1,24 @@
-#!/usr/bin/env python3
-"""
-Kalshi Command Center V5.0: Integrated Wallet & Bot Management
-"""
-
-import sys
 import os
+import sys
 import time
+import base64
 import requests
 import subprocess
-from datetime import datetime
+from dotenv import load_dotenv
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from textual.app import App, ComposeResult
-from textual.worker import Worker
 from textual.widgets import Header, Footer, Static, Button, Log, Label, DataTable
 from textual.containers import Horizontal, Vertical
-from dotenv import load_dotenv
-from kalshi_connection import get_kalshi_headers, test_connection
+from datetime import datetime
+from textual.worker import Worker
+from kalshi_connection import get_kalshi_headers as conn_get_kalshi_headers, test_connection
 from bot_state import load_state, save_state
 
-# Load Environment Variables
+# 1. Load Environment Variables
 load_dotenv()
 
-# Bot scripts mapping (same as original)
+# Map of bot keys to script filenames (expected in project root)
 BOT_SCRIPTS = {
     "credit_spread": "KalshiCreditSpread.py",
     "iron_condor": "KalshiIronCondor.py",
@@ -31,7 +29,7 @@ BOT_SCRIPTS = {
 }
 
 class KalshiDashboard(App):
-    """Command Center V5.0: Integrated Wallet & Bot Management."""
+    """Command Center V5.0: Integrated Wallet & Sniper."""
     
     CSS = """
     Screen { background: #1a1b26; }
@@ -45,26 +43,24 @@ class KalshiDashboard(App):
         height: 1; background: #0f1720; color: #c0caf5;
         content-align: left middle; padding-left: 1; border: solid #414868;
     }
+    #trades_table { height: 10; background: #24283b; border: solid #bb9af7; color: white; }
     #bots_table { height: 12; background: #24283b; border: solid #bb9af7; color: white; }
+    #bots_actions { height: 6; background: #24283b; border: solid #bb9af7; }
     DataTable { background: #24283b; border: solid #bb9af7; color: white; }
-    DataTable > .datatable--cursor { background: #7aa2f7; }
     Button { width: 100%; margin-bottom: 1; height: 3; }
     Label { text-style: bold; margin-bottom: 0; color: #f7768e; }
     Log { background: #1a1b26; border: solid #414868; height: 1fr; }
     """
-    
+
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("� Connecting to Kalshi API...", id="balance-panel")
+        yield Static("🔄 Connecting to Kalshi API...", id="balance-panel")
         with Horizontal():
             with Vertical(classes="box"):
                 yield Label("🚀 ACTIONS")
                 yield Button("Refresh All", id="btn_refresh", variant="primary")
                 yield Button("Start Trend Sniper", id="btn_snipe", variant="success")
                 yield Button("Stop All Bots", id="btn_stop", variant="error")
-                yield Button("📋 View Bot Logs", id="btn_logs", variant="primary")
-                yield Button("🔍 Real-time Monitor", id="btn_monitor", variant="success")
-            
             with Vertical(classes="box"):
                 yield Label("🤖 BOTS CONTROL")
                 # buttons for each bot
@@ -76,12 +72,18 @@ class KalshiDashboard(App):
             with Vertical(classes="box"):
                 yield Label("📊 POSITION MONITOR")
                 yield DataTable(id="trades_table")
+                # Sorting controls for bots table
+                with Horizontal(id="bots_controls"):
+                    yield Button("Sort: Bot", id="sort_bot", variant="primary")
+                    yield Button("Sort: Status", id="sort_status", variant="primary")
+                    yield Button("Sort: PID", id="sort_pid", variant="primary")
                 yield DataTable(id="bots_table")
+                # Per-row action buttons (Start/Stop) will be rendered here
+                yield Vertical(id="bots_actions")
                 yield Log(id="main_log")
-        
-        yield Static("Ready", id="status-strip")
-        yield Footer()
-    
+            yield Static("Ready", id="status-strip")
+            yield Footer()
+
     def on_mount(self) -> None:
         self.python_exe = sys.executable
         
@@ -103,6 +105,9 @@ class KalshiDashboard(App):
         
         # Bot process management
         self.bots: dict[str, subprocess.Popen] = {}
+        
+        # sort state: (column_key, reverse)
+        self._bots_sort = ("bot", False)
         
         # populate initial table
         self.log_message("About to call update_bots_table for first time...")
@@ -135,6 +140,10 @@ class KalshiDashboard(App):
             self.log_message(f"Error initializing status strip: {e}")
         
         self.log_message("System V5.0 Online. Initializing Sync...")
+
+    def _update_balance_panel(self, text: str):
+        """Thread-safe way to update balance panel."""
+        self.query_one("#balance-panel", Static).update(text)
     
     def _sync_worker(self):
         """Background worker for syncing balance."""
@@ -144,7 +153,7 @@ class KalshiDashboard(App):
             base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
             url = base_url + b_path
             
-            res = requests.get(url, headers=get_kalshi_headers("GET", b_path), timeout=2)
+            res = requests.get(url, headers=self.get_kalshi_headers("GET", b_path), timeout=2)
             
             if res.status_code == 200:
                 bal = res.json().get('balance', 0) / 100
@@ -161,45 +170,7 @@ class KalshiDashboard(App):
         except Exception as e:
             error_msg = f"❌ {type(e).__name__}: {str(e)[:40]}"
             self.call_from_thread(self.log_message, error_msg)
-    
-    def _update_balance_panel(self, text: str):
-        """Thread-safe way to update balance panel."""
-        try:
-            self.query_one("#balance-panel", Static).update(text)
-        except Exception as e:
-            self.log_message(f"Error updating balance: {e}")
-    
-    def update_bots_table(self) -> None:
-        """Update bots table with current status"""
-        try:
-            bots_table = self.query_one("#bots_table", DataTable)
-            
-            # Debug: log the update
-            self.log_message(f"Updating bots table with {len(BOT_SCRIPTS)} bots")
-            
-            # Build rows
-            rows = []
-            for key, script in BOT_SCRIPTS.items():
-                proc = self.bots.get(key)
-                if proc and proc.poll() is None:
-                    status = "running"
-                    pid = str(proc.pid)
-                else:
-                    status = "stopped"
-                    pid = "-"
-                rows.append((key, script, status, pid))
-                self.log_message(f"Bot: {key} ({script}) - Status: {status}")
 
-            # Clear and repopulate table
-            bots_table.clear()
-            for key, script, status, pid in rows:
-                bots_table.add_row(script, status, pid)
-            
-            self.log_message(f"Updated bots table with {len(BOT_SCRIPTS)} bots")
-            
-        except Exception as e:
-            self.log_message(f"Error updating bots table: {e}")
-    
     # ---- Bot process control ----
     def start_bot(self, key: str) -> None:
         """Start a bot script if not already running."""
@@ -216,20 +187,10 @@ class KalshiDashboard(App):
         script = BOT_SCRIPTS[key]
         script_path = os.path.join(os.getcwd(), script)
         try:
-            # Create log file for this bot if it doesn't exist
-            log_file = script.replace('.py', '.log')
-            
-            # Start bot with output redirected to log file (not DEVNULL)
-            with open(log_file, 'a') as log_f:
-                proc = subprocess.Popen([self.python_exe, script_path], 
-                                      stdout=log_f, stderr=log_f)
+            proc = subprocess.Popen([self.python_exe, script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.bots[key] = proc
-            self.log_message(f"🚀 Started {script} (PID {proc.pid}) - Log: {log_file}")
+            self.log_message(f"🚀 Started {script} (PID {proc.pid})")
             self.update_bots_table()
-            
-            # Start a worker to monitor the bot's log file
-            self.run_worker(lambda: self._monitor_bot_log(key), thread=True)
-            
             # persist state
             try:
                 st = load_state()
@@ -239,37 +200,6 @@ class KalshiDashboard(App):
                 pass
         except Exception as e:
             self.log_message(f"❌ Failed to start {script}: {e}")
-
-    def _monitor_bot_log(self, key: str):
-        """Monitor a bot's log file and stream output to main log."""
-        script = BOT_SCRIPTS[key]
-        log_file = script.replace('.py', '.log')
-        
-        # Wait a bit for the log file to be created
-        time.sleep(1)
-        
-        try:
-            if os.path.exists(log_file):
-                # Get current size
-                last_size = os.path.getsize(log_file)
-                
-                # Monitor for new content
-                while key in self.bots and self.bots[key].poll() is None:
-                    try:
-                        current_size = os.path.getsize(log_file)
-                        if current_size > last_size:
-                            with open(log_file, 'r', encoding='utf-8') as f:
-                                f.seek(last_size)
-                                new_lines = f.readlines()
-                                for line in new_lines:
-                                    self.call_from_thread(self.log_message, f"🤖 {script}: {line.strip()}")
-                            last_size = current_size
-                        time.sleep(2)  # Check every 2 seconds
-                    except Exception as e:
-                        self.call_from_thread(self.log_message, f"❌ Error monitoring {script} log: {e}")
-                        break
-        except Exception as e:
-            self.call_from_thread(self.log_message, f"❌ Failed to monitor {script} log: {e}")
 
     def stop_bot(self, key: str) -> None:
         """Stop a running bot by key."""
@@ -297,90 +227,159 @@ class KalshiDashboard(App):
                 save_state(st)
             except Exception:
                 pass
-    
-    def log_message(self, message: str):
-        """Log message to main log"""
+
+    def stop_all_bots(self) -> None:
+        # show confirmation dialog (non-blocking) — user must confirm
+        self.show_stop_confirmation()
+
+    def show_stop_confirmation(self) -> None:
+        """Mount a simple confirmation box with Confirm/Cancel buttons."""
+        if getattr(self, "_stop_confirm_visible", False):
+            return
+        self._stop_confirm_visible = True
+        confirm = Static("Are you sure you want to stop ALL bots?", id="stop_confirm")
+        # small action buttons
+        confirm_button = Button("Confirm Stop All", id="confirm_stop", variant="error")
+        cancel_button = Button("Cancel", id="cancel_stop", variant="primary")
+        # mount container
+        wrapper = Vertical(confirm, confirm_button, cancel_button, id="stop_confirm_wrapper")
+        self.mount(wrapper)
+
+    def hide_stop_confirmation(self) -> None:
         try:
-            self.query_one("#main_log", Log).write_line(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-            # update status strip with a concise last-action message
-            try:
-                short = message if len(message) <= 80 else message[:77] + "..."
-                status_strip = self.query_one("#status-strip", Static)
-                status_strip.update(f"{datetime.now().strftime('%H:%M:%S')} {short}")
-            except Exception:
-                pass
+            node = self.query_one("#stop_confirm_wrapper")
+            node.remove()
+        except Exception:
+            pass
+        self._stop_confirm_visible = False
+
+    def stop_all_bots_confirmed(self) -> None:
+        keys = list(self.bots.keys())
+        for k in keys:
+            self.stop_bot(k)
+        self.hide_stop_confirmation()
+
+    def update_bots_table(self) -> None:
+        bots_table = self.query_one("#bots_table", DataTable)
+        
+        # Debug: log the update
+        self.log_message(f"Updating bots table with {len(BOT_SCRIPTS)} bots")
+        
+        # Build rows and sort according to current sort state
+        rows = []
+        for key, script in BOT_SCRIPTS.items():
+            proc = self.bots.get(key)
+            if proc and proc.poll() is None:
+                status = "running"
+                pid = str(proc.pid)
+            else:
+                status = "stopped"
+                pid = "-"
+            rows.append((key, script, status, pid))
+            self.log_message(f"Bot: {key} ({script}) - Status: {status}")
+
+        col_key, reverse = self._bots_sort
+        if col_key == "bot":
+            rows.sort(key=lambda r: r[1].lower(), reverse=reverse)
+        elif col_key == "status":
+            rows.sort(key=lambda r: r[2].lower(), reverse=reverse)
+        elif col_key == "pid":
+            # sort by pid numeric where possible
+            def pid_key(r):
+                try:
+                    return int(r[3]) if r[3].isdigit() else (-1 if r[3] == "-" else 0)
+                except Exception:
+                    return -1
+            rows.sort(key=pid_key, reverse=reverse)
+
+        # Clear and repopulate table
+        bots_table.clear()
+        for key, script, status, pid in rows:
+            bots_table.add_row(script, status, pid)
+
+        # Update per-row action buttons container
+        try:
+            actions = self.query_one("#bots_actions", Vertical)
+            # clear existing
+            for child in list(actions.children):
+                child.remove()
+            for key, script, status, pid in rows:
+                pretty = script.replace('.py', '').replace('Kalshi', '').replace('_', ' ').strip()
+                if status == "running":
+                    b = Button(f"Stop {pretty}", id=f"row_stop_{key}", variant="error")
+                else:
+                    b = Button(f"Start {pretty}", id=f"row_start_{key}", variant="primary")
+                actions.mount(b)
         except Exception as e:
-            print(f"Error logging message: {e}")
+            self.log_message(f"Error updating action buttons: {e}")
+
+    def log_message(self, message: str):
+        self.query_one("#main_log", Log).write_line(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        # update status strip with a concise last-action message
+        try:
+            short = message if len(message) <= 80 else message[:77] + "..."
+            status_strip = self.query_one("#status-strip", Static)
+            status_strip.update(f"{datetime.now().strftime('%H:%M:%S')} {short}")
+        except Exception:
+            pass
+
+    def get_kalshi_headers(self, method, path):
+        """Wrapper that delegates header construction to `kalshi_connection.get_kalshi_headers`.
+
+        This centralizes auth logic so you can run `kalshi_connection.test_connection()`
+        independently for debugging.
+        """
+        try:
+            return conn_get_kalshi_headers(method, path)
+        except Exception as e:
+            # Surface header-building errors in the UI log for easier debugging
+            self.log_message(f"❌ Header build error: {e}")
+            raise
+
+
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle button press events"""
         bid = event.button.id
-        
-        # Handle action buttons
+        # Debug log every button press to help diagnose missing handlers
+        try:
+            self.log_message(f"🧭 Button pressed: {bid}")
+        except Exception:
+            pass
+        # Sorting control handlers
+        if bid in ("sort_bot", "sort_status", "sort_pid"):
+            # toggle sort direction if same column
+            mapping = {"sort_bot": "bot", "sort_status": "status", "sort_pid": "pid"}
+            key = mapping[bid]
+            if self._bots_sort[0] == key:
+                self._bots_sort = (key, not self._bots_sort[1])
+            else:
+                self._bots_sort = (key, False)
+            self.log_message(f"🔀 Sorting bots by {key} (reverse={self._bots_sort[1]})")
+            self.update_bots_table()
+            return
         if bid == "btn_refresh":
-            self.log_message("🔄 Manual refresh triggered...")
+            self.log_message("🔄 Manual sync triggered...")
+            # Run the sync worker in a separate thread (do not call the function)
             self.run_worker(self._sync_worker, thread=True)
         elif bid == "btn_snipe":
+            # start scanner bot via managed start
             self.start_bot("scanner")
         elif bid == "btn_stop":
-            self.log_message("� Stop all bots requested...")
-        elif bid == "btn_logs":
-            self.show_bot_logs()
-        elif bid == "btn_monitor":
-            self.start_real_time_monitor()
-        
-        # Handle bot start/stop buttons
+            # graceful stop all managed bots — show confirmation
+            self.log_message("🛑 Stop All requested — showing confirmation...")
+            self.stop_all_bots()
         elif bid and bid.startswith("start_"):
             key = bid.split("start_", 1)[1]
             self.start_bot(key)
         elif bid and bid.startswith("stop_"):
             key = bid.split("stop_", 1)[1]
             self.stop_bot(key)
-    
-    def show_bot_logs(self) -> None:
-        """Show bot logs in the main log"""
-        self.log_message("📋 === BOT LOGS ===")
-        
-        for key, script in BOT_SCRIPTS.items():
-            log_file = script.replace('.py', '.log')
-            try:
-                if os.path.exists(log_file):
-                    with open(log_file, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()[-5:]  # Last 5 lines
-                        if lines:
-                            self.log_message(f"📄 {script} (last 5 lines):")
-                            for line in lines:
-                                self.log_message(f"   {line.strip()}")
-                        else:
-                            self.log_message(f"📄 {script}: Empty log")
-                else:
-                    self.log_message(f"📄 {script}: No log file")
-            except Exception as e:
-                self.log_message(f"❌ Error reading {script} log: {e}")
-        
-        self.log_message("📋 === END LOGS ===")
-    
-    def start_real_time_monitor(self) -> None:
-        """Start real-time monitoring of all running bots."""
-        self.log_message("🔍 === REAL-TIME BOT MONITOR ===")
-        
-        running_bots = []
-        for key, proc in self.bots.items():
-            if proc.poll() is None:
-                running_bots.append(key)
-                self.log_message(f"🤖 {BOT_SCRIPTS[key]} is running (PID: {proc.pid})")
-        
-        if not running_bots:
-            self.log_message("⚠️ No bots are currently running")
-        else:
-            self.log_message(f"📊 Monitoring {len(running_bots)} running bots...")
-            
-            # Start log monitoring for each running bot
-            for key in running_bots:
-                self.run_worker(lambda k=key: self._monitor_bot_log(k), thread=True)
-        
-        self.log_message("🔍 === END MONITOR SETUP ===")
+        elif bid == "confirm_stop":
+            self.log_message("🛑 Confirmed stop all — stopping now")
+            self.stop_all_bots_confirmed()
+        elif bid == "cancel_stop":
+            self.log_message("✖️ Cancelled Stop All")
+            self.hide_stop_confirmation()
 
 if __name__ == "__main__":
-    app = KalshiDashboard()
-    app.run()
+    KalshiDashboard().run()

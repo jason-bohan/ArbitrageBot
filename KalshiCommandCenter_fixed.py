@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kalshi Command Center V5.0: Integrated Wallet & Bot Management
+Kalshi Command Center V5.0: Fixed Version - Integrated Wallet & Bot Management
 """
 
 import sys
@@ -20,7 +20,7 @@ from bot_state import load_state, save_state
 # Load Environment Variables
 load_dotenv()
 
-# Bot scripts mapping (same as original)
+# Bot scripts mapping
 BOT_SCRIPTS = {
     "credit_spread": "KalshiCreditSpread.py",
     "iron_condor": "KalshiIronCondor.py",
@@ -55,7 +55,7 @@ class KalshiDashboard(App):
     
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("� Connecting to Kalshi API...", id="balance-panel")
+        yield Static("🔄 Connecting to Kalshi API...", id="balance-panel")
         with Horizontal():
             with Vertical(classes="box"):
                 yield Label("🚀 ACTIONS")
@@ -64,12 +64,16 @@ class KalshiDashboard(App):
                 yield Button("Stop All Bots", id="btn_stop", variant="error")
                 yield Button("📋 View Bot Logs", id="btn_logs", variant="primary")
                 yield Button("🔍 Real-time Monitor", id="btn_monitor", variant="success")
+                yield Button("💰 Manual Trade", id="btn_manual_trade", variant="warning")
             
             with Vertical(classes="box"):
                 yield Label("🤖 BOTS CONTROL")
                 # buttons for each bot
                 for key, script in BOT_SCRIPTS.items():
                     pretty = script.replace('.py', '').replace('Kalshi', '').replace('_', ' ').strip()
+                    # Add trading indicator for bots that can trade
+                    if key in ["man_target_snipe", "credit_spread"]:
+                        pretty += " 💰"
                     yield Button(f"Start {pretty}", id=f"start_{key}", variant="primary")
                     yield Button(f"Stop {pretty}", id=f"stop_{key}", variant="error")
             
@@ -96,7 +100,7 @@ class KalshiDashboard(App):
         # Initialize bots table
         try:
             bots_table = self.query_one("#bots_table", DataTable)
-            bots_table.add_columns("Bot", "Status", "PID")
+            bots_table.add_columns("Bot", "Status", "PID", "Type")
             self.log_message("Bots table initialized successfully")
         except Exception as e:
             self.log_message(f"Error initializing bots table: {e}")
@@ -135,6 +139,8 @@ class KalshiDashboard(App):
             self.log_message(f"Error initializing status strip: {e}")
         
         self.log_message("System V5.0 Online. Initializing Sync...")
+        self.log_message("💰 Trading Bots: Manual Target Sniper, Credit Spread")
+        self.log_message("🔍 Scanning Bots: Trend Sniper, Profit Maximizer")
     
     def _sync_worker(self):
         """Background worker for syncing balance."""
@@ -174,9 +180,6 @@ class KalshiDashboard(App):
         try:
             bots_table = self.query_one("#bots_table", DataTable)
             
-            # Debug: log the update
-            self.log_message(f"Updating bots table with {len(BOT_SCRIPTS)} bots")
-            
             # Build rows
             rows = []
             for key, script in BOT_SCRIPTS.items():
@@ -187,20 +190,27 @@ class KalshiDashboard(App):
                 else:
                     status = "stopped"
                     pid = "-"
-                rows.append((key, script, status, pid))
+                
+                # Add bot type
+                if key in ["man_target_snipe", "credit_spread"]:
+                    bot_type = "💰 Trading"
+                elif key in ["scanner", "profit_maximizer"]:
+                    bot_type = "🔍 Scanning"
+                else:
+                    bot_type = "📊 Analysis"
+                
+                rows.append((key, script, status, pid, bot_type))
                 self.log_message(f"Bot: {key} ({script}) - Status: {status}")
 
             # Clear and repopulate table
             bots_table.clear()
-            for key, script, status, pid in rows:
-                bots_table.add_row(script, status, pid)
-            
-            self.log_message(f"Updated bots table with {len(BOT_SCRIPTS)} bots")
+            bots_table.add_columns("Bot", "Status", "PID", "Type")
+            for key, script, status, pid, bot_type in rows:
+                bots_table.add_row(script, status, pid, bot_type)
             
         except Exception as e:
             self.log_message(f"Error updating bots table: {e}")
     
-    # ---- Bot process control ----
     def start_bot(self, key: str) -> None:
         """Start a bot script if not already running."""
         if key not in BOT_SCRIPTS:
@@ -219,16 +229,23 @@ class KalshiDashboard(App):
             # Create log file for this bot if it doesn't exist
             log_file = script.replace('.py', '.log')
             
-            # Start bot with output redirected to log file (not DEVNULL)
+            # Start bot with output redirected to log file
             with open(log_file, 'a') as log_f:
                 proc = subprocess.Popen([self.python_exe, script_path], 
                                       stdout=log_f, stderr=log_f)
             self.bots[key] = proc
-            self.log_message(f"🚀 Started {script} (PID {proc.pid}) - Log: {log_file}")
+            
+            # Add trading indicator
+            if key in ["man_target_snipe", "credit_spread"]:
+                trading_msg = " 💰 [TRADING ENABLED]"
+            else:
+                trading_msg = " 🔍 [SCANNING ONLY]"
+            
+            self.log_message(f"🚀 Started {script} (PID {proc.pid}) - Log: {log_file}{trading_msg}")
             self.update_bots_table()
             
-            # Start a worker to monitor the bot's log file
-            self.run_worker(lambda: self._monitor_bot_log(key), thread=True)
+            # Start log monitoring for this bot
+            self._monitor_bot_log(key)
             
             # persist state
             try:
@@ -241,35 +258,30 @@ class KalshiDashboard(App):
             self.log_message(f"❌ Failed to start {script}: {e}")
 
     def _monitor_bot_log(self, key: str):
-        """Monitor a bot's log file and stream output to main log."""
+        """Simple log monitoring - just read latest lines periodically."""
         script = BOT_SCRIPTS[key]
         log_file = script.replace('.py', '.log')
         
-        # Wait a bit for the log file to be created
-        time.sleep(1)
+        def monitor():
+            while key in self.bots and self.bots[key].poll() is None:
+                try:
+                    if os.path.exists(log_file):
+                        with open(log_file, 'r', encoding='utf-8') as f:
+                            lines = f.readlines()
+                            if lines:
+                                # Show last 3 lines
+                                for line in lines[-3:]:
+                                    if line.strip():
+                                        self.call_from_thread(self.log_message, f"🤖 {script}: {line.strip()}")
+                    time.sleep(5)  # Check every 5 seconds
+                except Exception as e:
+                    self.call_from_thread(self.log_message, f"❌ Error monitoring {script} log: {e}")
+                    break
         
-        try:
-            if os.path.exists(log_file):
-                # Get current size
-                last_size = os.path.getsize(log_file)
-                
-                # Monitor for new content
-                while key in self.bots and self.bots[key].poll() is None:
-                    try:
-                        current_size = os.path.getsize(log_file)
-                        if current_size > last_size:
-                            with open(log_file, 'r', encoding='utf-8') as f:
-                                f.seek(last_size)
-                                new_lines = f.readlines()
-                                for line in new_lines:
-                                    self.call_from_thread(self.log_message, f"🤖 {script}: {line.strip()}")
-                            last_size = current_size
-                        time.sleep(2)  # Check every 2 seconds
-                    except Exception as e:
-                        self.call_from_thread(self.log_message, f"❌ Error monitoring {script} log: {e}")
-                        break
-        except Exception as e:
-            self.call_from_thread(self.log_message, f"❌ Failed to monitor {script} log: {e}")
+        # Start monitoring in background
+        import threading
+        thread = threading.Thread(target=monitor, daemon=True)
+        thread.start()
 
     def stop_bot(self, key: str) -> None:
         """Stop a running bot by key."""
@@ -323,9 +335,11 @@ class KalshiDashboard(App):
         elif bid == "btn_snipe":
             self.start_bot("scanner")
         elif bid == "btn_stop":
-            self.log_message("� Stop all bots requested...")
+            self.log_message("🛑 Stop all bots requested...")
         elif bid == "btn_logs":
             self.show_bot_logs()
+        elif bid == "btn_manual_trade":
+            self.show_manual_trade_dialog()
         elif bid == "btn_monitor":
             self.start_real_time_monitor()
         
@@ -368,18 +382,88 @@ class KalshiDashboard(App):
         for key, proc in self.bots.items():
             if proc.poll() is None:
                 running_bots.append(key)
-                self.log_message(f"🤖 {BOT_SCRIPTS[key]} is running (PID: {proc.pid})")
+                bot_type = "💰 Trading" if key in ["man_target_snipe", "credit_spread"] else "🔍 Scanning"
+                self.log_message(f"🤖 {BOT_SCRIPTS[key]} is {bot_type} (PID: {proc.pid})")
         
         if not running_bots:
             self.log_message("⚠️ No bots are currently running")
         else:
             self.log_message(f"📊 Monitoring {len(running_bots)} running bots...")
-            
-            # Start log monitoring for each running bot
-            for key in running_bots:
-                self.run_worker(lambda k=key: self._monitor_bot_log(k), thread=True)
         
         self.log_message("🔍 === END MONITOR SETUP ===")
+    
+    def show_manual_trade_dialog(self) -> None:
+        """Show manual trading interface."""
+        self.log_message("💰 === MANUAL TRADING ===")
+        
+        # Get current opportunities from scanner log
+        scanner_log = "scanner_bot.log"
+        opportunities = []
+        
+        try:
+            if os.path.exists(scanner_log):
+                with open(scanner_log, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        if "OPPORTUNITY" in line or "GAP" in line:
+                            opportunities.append(line.strip())
+        except Exception as e:
+            self.log_message(f"❌ Error reading scanner log: {e}")
+        
+        if opportunities:
+            self.log_message("🎯 Recent Opportunities (from scanner):")
+            for opp in opportunities[-5:]:  # Show last 5
+                self.log_message(f"   {opp}")
+        else:
+            self.log_message("📊 No recent opportunities found")
+        
+        # Show available tickers for manual trading
+        self.log_message("📋 Available for Manual Trade:")
+        tickers = [
+            "KXETH15M-26FEB191215",  # ETH 15m
+            # Add more tickers as needed
+        ]
+        
+        for ticker in tickers:
+            try:
+                # Get current market data
+                url = f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}"
+                res = requests.get(url, headers=get_kalshi_headers("GET", f"/trade-api/v2/markets/{ticker}"))
+                if res.status_code == 200:
+                    market = res.json().get('market', {})
+                    yes_ask = market.get('yes_ask', 0)
+                    no_ask = market.get('no_ask', 0)
+                    cap = market.get('cap', 'N/A')
+                    
+                    self.log_message(f"📊 {ticker}: Yes={yes_ask}¢, No={no_ask}¢, Target={cap}")
+                    
+                    # Simple trade recommendation
+                    if yes_ask <= 25:
+                        self.log_message(f"💡 CONSIDER BUYING YES: {ticker} at {yes_ask}¢ (low cost)")
+                    if no_ask <= 25:
+                        self.log_message(f"💡 CONSIDER BUYING NO: {ticker} at {no_ask}¢ (low cost)")
+                        
+            except Exception as e:
+                self.log_message(f"❌ Error getting data for {ticker}: {e}")
+        
+        self.log_message("💰 === END MANUAL TRADING ===")
+        self.log_message("📝 To trade manually: Use Kalshi web interface with the tickers above")
+    
+    def place_manual_order(self, ticker: str, side: str, count: int = 5):
+        """Place a manual order (for future implementation)."""
+        self.log_message(f"💰 Manual order: {side} {count} contracts of {ticker}")
+        self.log_message("📝 Feature coming soon - use Kalshi web interface for now")
+        
+        # TODO: Implement actual order placement
+        # path = "/trade-api/v2/portfolio/orders"
+        # payload = {
+        #     "ticker": ticker,
+        #     "action": side,
+        #     "count": count,
+        #     "type": "market",
+        #     "side": side
+        # }
+        # ... actual API call ...
 
 if __name__ == "__main__":
     app = KalshiDashboard()
