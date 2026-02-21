@@ -19,7 +19,7 @@ load_dotenv()
 
 BASE_URL       = "https://api.elections.kalshi.com"
 COINGECKO_URL  = "https://api.coingecko.com/api/v3/simple/price"
-SCALP_WINDOW      = 120   # seconds before close to enter (2 min)
+SCALP_WINDOW      = 180   # seconds before close to enter (3 min)
 MIN_EDGE_PCT      = 0.10  # price must be 0.10% above/below strike to act
 HIGH_CONF_PRICE   = 85    # if a side is priced >= this, it's high-confidence
 RISK_PCT          = 0.25  # risk 25% of balance on high-confidence trades
