@@ -20,11 +20,12 @@ BASE_URL          = "https://api.elections.kalshi.com"
 COINGECKO_URL     = "https://api.coingecko.com/api/v3/simple/price"
 STOP_LOSS_CENTS   = 4    # wider stop to handle spread + volatility
 TAKE_PROFIT_CENTS = 3
-MAX_ENTRY_PRICE   = 60   # don't enter if side already > 60c
-MIN_SECS_LEFT     = 300  # NEVER enter with less than 5 min left (last 2 min are too wild)
-MAX_SECS_LEFT     = 780  # flipper entry: up to 13 min before close
-MAX_FLIPS         = 2    # max flips before bailing — avoid runaway losses
+MAX_ENTRY_PRICE   = 65   # don't enter if side already > 65c
+MIN_SECS_LEFT     = 300  # NEVER enter with less than 5 min left
+MAX_SECS_LEFT     = 840  # flipper entry: up to 14 min before close
+MAX_FLIPS         = 2    # max flips before bailing
 CONTRACTS         = 1
+FORCE_ENTRY_PRICE = 55   # if either side is <= this with no signal, enter anyway
 AUTO_TRADE        = os.getenv("AUTO_TRADE", "true").lower() == "true"
 TELEGRAM_TOKEN    = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
 JASON_CHAT_ID     = "7478453115"
@@ -129,11 +130,13 @@ def pick_side(market, orderbook):
     obi = calculate_obi(orderbook)
     series = market["ticker"].split("-")[0]
 
-    # OBI signal
-    if abs(obi) >= 0.15:
+    # OBI signal — only use if the selected side is affordable
+    if abs(obi) >= 0.10:
         side = "yes" if obi > 0 else "no"
         price = market.get("yes_ask" if side == "yes" else "no_ask", 50)
-        return side, price, f"OBI={obi:+.2f}"
+        if price <= MAX_ENTRY_PRICE:
+            return side, price, f"OBI={obi:+.2f}"
+        # OBI side too expensive — fall through to other checks
 
     # Fallback: CoinGecko for crypto markets
     coin = COIN_MAP.get(series)
@@ -142,10 +145,19 @@ def pick_side(market, orderbook):
         floor = market.get("floor_strike", 0)
         if live and floor:
             edge_pct = (live - floor) / floor * 100
-            if abs(edge_pct) >= 0.10:
+            if abs(edge_pct) >= 0.05:
                 side = "yes" if live >= floor else "no"
                 price = market.get("yes_ask" if side == "yes" else "no_ask", 50)
                 return side, price, f"price_edge={edge_pct:+.2f}%"
+
+    # Force entry: if price is near 50/50, pick the cheaper side
+    ya = market.get("yes_ask", 50)
+    na = market.get("no_ask", 50)
+    if ya <= FORCE_ENTRY_PRICE or na <= FORCE_ENTRY_PRICE:
+        if ya <= na:
+            return "yes", ya, f"forced(YES cheaper @ {ya}c)"
+        else:
+            return "no", na, f"forced(NO cheaper @ {na}c)"
 
     return None, None, "no_signal"
 
