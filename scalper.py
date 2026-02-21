@@ -19,10 +19,13 @@ load_dotenv()
 
 BASE_URL       = "https://api.elections.kalshi.com"
 COINGECKO_URL  = "https://api.coingecko.com/api/v3/simple/price"
-SCALP_WINDOW   = 120      # seconds before close to enter (2 min)
-MIN_EDGE_PCT   = 0.15     # price must be 0.15% above/below strike to act
-MAX_CONTRACTS  = 3        # max contracts per trade
-AUTO_TRADE     = os.getenv("AUTO_TRADE", "true").lower() == "true"
+SCALP_WINDOW      = 120   # seconds before close to enter (2 min)
+MIN_EDGE_PCT      = 0.10  # price must be 0.10% above/below strike to act
+HIGH_CONF_PRICE   = 85    # if a side is priced >= this, it's high-confidence
+RISK_PCT          = 0.25  # risk 25% of balance on high-confidence trades
+RISK_PCT_NORMAL   = 0.10  # risk 10% on normal trades
+MAX_CONTRACTS     = 10    # hard cap
+AUTO_TRADE        = os.getenv("AUTO_TRADE", "true").lower() == "true"
 
 TELEGRAM_TOKEN = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
 JASON_CHAT_ID  = "7478453115"
@@ -198,16 +201,26 @@ def scan_loop():
                     if trade:
                         side, price_cents, edge = trade
                         profit_per = (100 - price_cents) / 100
-                        contracts = min(MAX_CONTRACTS, max(1, int(get_balance() or 1)))
+                        balance = get_balance() or 1
 
-                        print(f"       ✅ Trade signal: BUY {side.upper()} @ {price_cents}¢ | profit/contract: ${profit_per:.2f}")
+                        # Size based on confidence: 25% on high-conf (≥85c), 10% normal
+                        if price_cents >= HIGH_CONF_PRICE:
+                            risk_amt = balance * RISK_PCT
+                            conf_label = "HIGH CONF 25%"
+                        else:
+                            risk_amt = balance * RISK_PCT_NORMAL
+                            conf_label = "normal 10%"
+
+                        contracts = min(MAX_CONTRACTS, max(1, int(risk_amt / (price_cents / 100))))
+
+                        print(f"       ✅ {conf_label} | BUY {side.upper()} @ {price_cents}¢ | {contracts} contracts | profit if wins: ${profit_per*contracts:.2f}")
 
                         msg = (
-                            f"🔪 *Scalp signal!*\n"
+                            f"🔪 *Scalp!* [{conf_label}]\n"
                             f"`{ticker}`\n"
                             f"Live: ${live_price:,.2f} | Strike: ${floor_strike:,.2f}\n"
                             f"Edge: {edge:+.2f}% | Buy {side.upper()} @ {price_cents}¢\n"
-                            f"Profit if wins: ${profit_per*contracts:.2f} ({contracts} contracts)"
+                            f"{contracts} contracts | Profit if wins: ${profit_per*contracts:.2f}"
                         )
 
                         if AUTO_TRADE:
