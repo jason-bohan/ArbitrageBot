@@ -250,7 +250,7 @@ def scan_loop():
     print(f"  Scanning: BTC/ETH (CoinGecko) + ALL closing-soon markets")
     print("=" * 60)
 
-    tg("🔪 *Scalper online* — sweeping ALL markets closing in last 2 min.")
+    tg(f"🔪 *Scalper online* — sweeping ALL markets closing in last {SCALP_WINDOW//60} min.")
 
     traded_tickers = set()
     last_status = 0
