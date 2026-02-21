@@ -1,164 +1,191 @@
+"""
+KalshiScanner.py - Live arbitrage & spread scanner for KXETH15M / KXBTC15M
+and hourly crypto range markets.
+
+Scan interval: 10 seconds
+Opportunity threshold: gap >= 2 cents, ask <= 50 cents
+"""
 import os
 import sys
 import time
-import base64
-import requests
-import signal
 import json
-from dotenv import load_dotenv
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+import signal
+import requests
+import uuid
 from datetime import datetime
+from dotenv import load_dotenv
 from kalshi_connection import get_kalshi_headers
+from market_discovery import find_opportunities
 
 load_dotenv()
 
+BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+
+# --- Config ---
+MAX_SPEND_PER_TRADE = float(os.getenv("MAX_SPEND_PER_TRADE", "1.00"))  # $ per trade
+MIN_GAP = int(os.getenv("MIN_GAP", "3"))                               # cents
+MAX_ASK = int(os.getenv("MAX_ASK", "50"))                              # cents
+AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"        # off by default
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10"))                  # seconds
+
+
 class KalshiScannerBot:
-    """Headless Arbitrage & Spread Scanner Bot."""
-    
     def __init__(self):
         self.running = True
-        self.log_file = "scanner_bot.log"
+        self.log_file = "KalshiScanner.log"
         self.state_file = "scanner_state.json"
-        
-        # Set up signal handlers for graceful shutdown
+        self.trades_today = 0
+        self.pnl_today = 0.0
+
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
-        
+
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully."""
-        self.log_message(f"Received signal {signum}, shutting down...")
+        self.log(f"Signal {signum} received — shutting down cleanly.")
         self.running = False
-        
-    def log_message(self, message: str):
-        """Log messages to file with timestamp."""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log_entry = f"[{timestamp}] {message}\n"
-        
+
+    def log(self, msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
         try:
             with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(log_entry)
-            print(log_entry.strip())  # Also print to console for debugging
-        except Exception as e:
-            print(f"Failed to write to log: {e}")
-    
-    def save_state(self, state_data):
-        """Save bot state to file."""
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    def save_state(self, data: dict):
         try:
             with open(self.state_file, "w") as f:
-                json.dump(state_data, f, indent=2)
+                json.dump(data, f, indent=2)
         except Exception as e:
-            self.log_message(f"Failed to save state: {e}")
-    
-    def load_state(self):
-        """Load bot state from file."""
+            self.log(f"State save error: {e}")
+
+    def get_balance(self) -> float | None:
         try:
-            with open(self.state_file, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    
-    def get_market_data(self, ticker):
-        """Calculates the gap between 'Yes' and 'No' costs."""
-        try:
-            url = f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}"
-            res = requests.get(url, headers=get_kalshi_headers("GET", f"/trade-api/v2/markets/{ticker}"))
+            path = "/trade-api/v2/portfolio/balance"
+            res = requests.get(
+                BASE_URL + path,
+                headers=get_kalshi_headers("GET", path),
+                timeout=5,
+            )
             if res.status_code == 200:
-                m = res.json().get('market', {})
-                yes_cost = m.get('yes_bid', 0)
-                no_cost = m.get('no_bid', 0)
-                # Total cost should be 100. Anything less is a 'Spread Gap'
-                gap = 100 - (yes_cost + no_cost)
-                target = m.get('cap', 'N/A')
-                return {
-                    "yes_cost": yes_cost,
-                    "no_cost": no_cost,
-                    "gap": gap,
-                    "target": target,
-                    "status": m.get('status', 'unknown').upper()
+                return res.json().get("balance", 0) / 100
+        except Exception as e:
+            self.log(f"Balance check error: {e}")
+        return None
+
+    def place_order(self, ticker: str, side: str, ask_cents: int) -> bool:
+        """
+        Place a limit order. Buys as many contracts as MAX_SPEND_PER_TRADE allows.
+        side: 'yes' or 'no'
+        ask_cents: current ask price in cents (1-99)
+        """
+        if ask_cents <= 0:
+            self.log(f"Skipping {ticker} — invalid ask price {ask_cents}¢")
+            return False
+
+        count = max(1, int((MAX_SPEND_PER_TRADE * 100) / ask_cents))
+        path = "/trade-api/v2/portfolio/orders"
+        url = BASE_URL + path
+
+        payload = {
+            "action": "buy",
+            "count": count,
+            "side": side,
+            "ticker": ticker,
+            "type": "limit",
+            "yes_price": ask_cents if side == "yes" else (100 - ask_cents),
+            "client_order_id": str(uuid.uuid4()),
+        }
+
+        try:
+            headers = get_kalshi_headers("POST", path)
+            headers["Content-Type"] = "application/json"
+            res = requests.post(url, json=payload, headers=headers, timeout=5)
+            if res.status_code == 201:
+                cost = (ask_cents * count) / 100
+                self.log(f"✅ ORDER PLACED | {ticker} | {side.upper()} x{count} @ {ask_cents}¢ | cost=${cost:.2f}")
+                self.trades_today += 1
+                return True
+            else:
+                self.log(f"❌ Order rejected ({res.status_code}): {res.text[:200]}")
+                return False
+        except Exception as e:
+            self.log(f"❌ Order exception: {e}")
+            return False
+
+    def scan(self):
+        balance = self.get_balance()
+        if balance is not None:
+            self.log(f"Balance: ${balance:.2f} | Trades today: {self.trades_today}")
+
+        if balance is not None and balance < 0.05:
+            self.log("⚠️  Balance too low to trade — scanning only.")
+
+        opps = find_opportunities(min_gap=MIN_GAP, max_ask=MAX_ASK)
+
+        if not opps:
+            self.log("No opportunities found this scan.")
+        else:
+            self.log(f"Found {len(opps)} opportunity(s):")
+            for o in opps[:10]:
+                ticker = o["ticker"]
+                gap = o["_gap"]
+                side = o["_best_side"]
+                ask = o["_best_ask"]
+                mins = o["_mins_left"]
+                vol = o.get("volume", 0)
+                self.log(
+                    f"  🎯 {ticker} | gap={gap}¢ | best={side}@{ask}¢ "
+                    f"| mins_left={mins} | vol={vol}"
+                )
+
+                if AUTO_TRADE and balance is not None and balance >= (ask / 100):
+                    self.place_order(ticker, side, ask)
+                elif AUTO_TRADE:
+                    self.log(f"  💸 Skipping trade — insufficient balance (${balance:.2f})")
+
+        # Save state
+        self.save_state({
+            "last_scan": datetime.now().isoformat(),
+            "opportunities_found": len(opps),
+            "balance": balance,
+            "trades_today": self.trades_today,
+            "auto_trade": AUTO_TRADE,
+            "top_opps": [
+                {
+                    "ticker": o["ticker"],
+                    "gap": o["_gap"],
+                    "side": o["_best_side"],
+                    "ask": o["_best_ask"],
+                    "mins_left": o["_mins_left"],
                 }
-        except Exception as e:
-            self.log_message(f"Error getting market data for {ticker}: {e}")
-            return None
-        return None
-    
-    def check_balance(self):
-        """Check current account balance."""
-        try:
-            b_path = "/trade-api/v2/portfolio/balance"
-            base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
-            url = base_url + b_path
-            res = requests.get(url, headers=get_kalshi_headers("GET", b_path))
-            if res.status_code == 200:
-                balance = res.json().get('balance', 0) / 100
-                return balance
-        except Exception as e:
-            self.log_message(f"Error checking balance: {e}")
-        return None
-    
-    def scan_opportunities(self):
-        """Main scanning logic for arbitrage opportunities."""
-        try:
-            # Check balance
-            balance = self.check_balance()
-            if balance is not None:
-                self.log_message(f"Current balance: ${balance:.2f}")
-            
-            # Monitor specific tickers
-            tickers = [
-                "KXETH15M-26FEB191215",  # ETH 15m
-                # Add more tickers as needed
-            ]
-            
-            opportunities = []
-            
-            for ticker in tickers:
-                data = self.get_market_data(ticker)
-                if data:
-                    gap = data['gap']
-                    if gap > 1:  # Only log if there's a meaningful gap
-                        self.log_message(f"OPPORTUNITY: {ticker} - Gap: {gap}¢, Yes: {data['yes_cost']}¢, No: {data['no_cost']}¢")
-                        opportunities.append({
-                            "ticker": ticker,
-                            "gap": gap,
-                            "yes_cost": data['yes_cost'],
-                            "no_cost": data['no_cost'],
-                            "status": data['status']
-                        })
-                    else:
-                        self.log_message(f"MONITOR: {ticker} - Gap: {gap}¢ (no opportunity)")
-            
-            # Save opportunities to state
-            if opportunities:
-                self.save_state({
-                    "last_scan": datetime.now().isoformat(),
-                    "opportunities": opportunities,
-                    "balance": balance
-                })
-                
-        except Exception as e:
-            self.log_message(f"Error in scan_opportunities: {e}")
-    
+                for o in opps[:5]
+            ],
+        })
+
     def run(self):
-        """Main bot loop."""
-        self.log_message("Kalshi Scanner Bot starting...")
-        self.log_message(f"PID: {os.getpid()}")
-        
-        # Initial scan
-        self.scan_opportunities()
-        
-        # Main loop - scan every 10 seconds
+        self.log("=" * 60)
+        self.log("Kalshi Scanner Bot starting")
+        self.log(f"  Auto-trade: {AUTO_TRADE}")
+        self.log(f"  Max spend/trade: ${MAX_SPEND_PER_TRADE:.2f}")
+        self.log(f"  Min gap: {MIN_GAP}¢  |  Max ask: {MAX_ASK}¢")
+        self.log(f"  Scan interval: {SCAN_INTERVAL}s")
+        self.log("=" * 60)
+
         while self.running:
             try:
-                self.scan_opportunities()
-                time.sleep(10)
-            except KeyboardInterrupt:
-                break
+                self.scan()
             except Exception as e:
-                self.log_message(f"Error in main loop: {e}")
-                time.sleep(5)  # Wait before retrying
-        
-        self.log_message("Kalshi Scanner Bot stopped")
+                self.log(f"Scan error: {e}")
+            for _ in range(SCAN_INTERVAL):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+        self.log("Scanner stopped.")
+
 
 if __name__ == "__main__":
     bot = KalshiScannerBot()

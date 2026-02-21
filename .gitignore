@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.log
+*.json
+!bots_state.json
+.env
+kalshi.key
+scanner_state.json
+credit_spread_state.json

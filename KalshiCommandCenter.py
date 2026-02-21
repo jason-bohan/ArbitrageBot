@@ -1,386 +1,315 @@
 #!/usr/bin/env python3
 """
-Kalshi Command Center V5.0: Integrated Wallet & Bot Management
+Kalshi Command Center — Clean single-file TUI.
+Manages bots, shows live balance, scanner opportunities, and logs.
 """
-
-import sys
 import os
+import sys
 import time
-import requests
 import subprocess
+import requests
 from datetime import datetime
-from textual.app import App, ComposeResult
-from textual.worker import Worker
-from textual.widgets import Header, Footer, Static, Button, Log, Label, DataTable
-from textual.containers import Horizontal, Vertical
 from dotenv import load_dotenv
-from kalshi_connection import get_kalshi_headers, test_connection
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, Static, Button, Log, Label, DataTable
+from textual.containers import Horizontal, Vertical, ScrollableContainer
+from kalshi_connection import get_kalshi_headers
 from bot_state import load_state, save_state
+from market_discovery import find_opportunities
 
-# Load Environment Variables
 load_dotenv()
 
-# Bot scripts mapping (same as original)
+BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+
 BOT_SCRIPTS = {
-    "credit_spread": "KalshiCreditSpread.py",
-    "iron_condor": "KalshiIronCondor.py",
-    "pairs": "KalshiPairs.py",
-    "scanner": "KalshiScanner.py",
-    "profit_maximizer": "ProfitMaximizer.py",
-    "man_target_snipe": "KalshiManTargetSnipe.py",
+    "scanner":         "KalshiScanner.py",
+    "credit_spread":   "KalshiCreditSpread.py",
+    "iron_condor":     "KalshiIronCondor.py",
+    "pairs":           "KalshiPairs.py",
+    "profit_max":      "ProfitMaximizer.py",
+    "snipe":           "KalshiManTargetSnipe.py",
 }
 
-class KalshiDashboard(App):
-    """Command Center V5.0: Integrated Wallet & Bot Management."""
-    
+BOT_LABELS = {
+    "scanner":       "📡 Scanner",
+    "credit_spread": "📈 Credit Spread",
+    "iron_condor":   "🦅 Iron Condor",
+    "pairs":         "🔗 Pairs",
+    "profit_max":    "💰 Profit Max",
+    "snipe":         "🎯 Target Snipe",
+}
+
+
+class KalshiCommandCenter(App):
+    """Kalshi Command Center — bot management + live scanner."""
+
     CSS = """
     Screen { background: #1a1b26; }
-    .box { height: 100%; border: solid #7aa2f7; margin: 1; padding: 1; }
-    #balance-panel {
+
+    #header-bar {
         height: 3; background: #24283b; color: #9ece6a;
         content-align: center middle; text-style: bold;
-        border: double #9ece6a; margin: 1;
+        border: double #9ece6a; margin: 0 1 1 1;
     }
-    #status-strip {
+    #status-bar {
         height: 1; background: #0f1720; color: #c0caf5;
-        content-align: left middle; padding-left: 1; border: solid #414868;
+        content-align: left middle; padding-left: 1;
     }
-    #bots_table { height: 12; background: #24283b; border: solid #bb9af7; color: white; }
-    DataTable { background: #24283b; border: solid #bb9af7; color: white; }
-    DataTable > .datatable--cursor { background: #7aa2f7; }
+
+    .panel { border: solid #414868; margin: 0 1; padding: 0 1; }
+    .panel-title { color: #f7768e; text-style: bold; margin-bottom: 1; }
+
+    #left-panel { width: 28; }
+    #center-panel { width: 1fr; }
+    #right-panel { width: 50; }
+
+    DataTable { background: #24283b; height: 12; }
+    DataTable > .datatable--cursor { background: #7aa2f7; color: #1a1b26; }
+    DataTable > .datatable--header { background: #1f2335; color: #7aa2f7; text-style: bold; }
+
     Button { width: 100%; margin-bottom: 1; height: 3; }
-    Label { text-style: bold; margin-bottom: 0; color: #f7768e; }
-    Log { background: #1a1b26; border: solid #414868; height: 1fr; }
+    Button.start { background: #1a472a; color: #9ece6a; }
+    Button.stop  { background: #4a0000; color: #f7768e; }
+    Button.action { background: #24283b; color: #7aa2f7; }
+
+    Log { background: #1a1b26; border: solid #414868; height: 1fr; color: #c0caf5; }
+
+    #opp-table { height: 10; }
     """
-    
+
     def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static("� Connecting to Kalshi API...", id="balance-panel")
+        yield Header(show_clock=True)
+        yield Static("💰 Connecting…", id="header-bar")
+
         with Horizontal():
-            with Vertical(classes="box"):
-                yield Label("🚀 ACTIONS")
-                yield Button("Refresh All", id="btn_refresh", variant="primary")
-                yield Button("Start Trend Sniper", id="btn_snipe", variant="success")
-                yield Button("Stop All Bots", id="btn_stop", variant="error")
-                yield Button("📋 View Bot Logs", id="btn_logs", variant="primary")
-                yield Button("🔍 Real-time Monitor", id="btn_monitor", variant="success")
-            
-            with Vertical(classes="box"):
-                yield Label("🤖 BOTS CONTROL")
-                # buttons for each bot
-                for key, script in BOT_SCRIPTS.items():
-                    pretty = script.replace('.py', '').replace('Kalshi', '').replace('_', ' ').strip()
-                    yield Button(f"Start {pretty}", id=f"start_{key}", variant="primary")
-                    yield Button(f"Stop {pretty}", id=f"stop_{key}", variant="error")
-            
-            with Vertical(classes="box"):
-                yield Label("📊 POSITION MONITOR")
-                yield DataTable(id="trades_table")
+            # LEFT: Bot controls
+            with Vertical(id="left-panel", classes="panel"):
+                yield Label("🤖 BOT CONTROLS", classes="panel-title")
+                for key in BOT_SCRIPTS:
+                    yield Button(BOT_LABELS[key], id=f"start_{key}", classes="start")
+                    yield Button(f"Stop {key}", id=f"stop_{key}", classes="stop")
+                yield Label(" ", classes="panel-title")
+                yield Button("⛔ Stop All", id="btn_stop_all", classes="stop")
+                yield Button("🔄 Refresh", id="btn_refresh", classes="action")
+
+            # CENTER: Bots table + Opportunities + Log
+            with Vertical(id="center-panel", classes="panel"):
+                yield Label("📊 BOT STATUS", classes="panel-title")
                 yield DataTable(id="bots_table")
+                yield Label("🎯 LIVE OPPORTUNITIES", classes="panel-title")
+                yield DataTable(id="opp_table")
+                yield Label("📋 LOG", classes="panel-title")
                 yield Log(id="main_log")
-        
-        yield Static("Ready", id="status-strip")
+
+            # RIGHT: Scanner state
+            with Vertical(id="right-panel", classes="panel"):
+                yield Label("📡 SCANNER FEED", classes="panel-title")
+                yield Log(id="scanner_log")
+
+        yield Static("Initializing…", id="status-bar")
         yield Footer()
-    
+
     def on_mount(self) -> None:
         self.python_exe = sys.executable
-        
-        # Initialize trades table
-        try:
-            trades_table = self.query_one("#trades_table", DataTable)
-            trades_table.add_columns("Ticker", "Qty", "Target", "Side", "Outcome")
-            self.log_message("Trades table initialized successfully")
-        except Exception as e:
-            self.log_message(f"Error initializing trades table: {e}")
-        
-        # Initialize bots table
-        try:
-            bots_table = self.query_one("#bots_table", DataTable)
-            bots_table.add_columns("Bot", "Status", "PID")
-            self.log_message("Bots table initialized successfully")
-        except Exception as e:
-            self.log_message(f"Error initializing bots table: {e}")
-        
-        # Bot process management
         self.bots: dict[str, subprocess.Popen] = {}
-        
-        # populate initial table
-        self.log_message("About to call update_bots_table for first time...")
-        self.update_bots_table()
-        
-        # restore saved bot state (start bots that were running)
-        try:
-            saved = load_state()
-            self.log_message(f"Loaded saved state: {saved}")
-            for key, running in saved.items():
-                if running and key in BOT_SCRIPTS:
-                    self.log_message(f"🔁 Restoring bot: {key}")
-                    self.start_bot(key)
-        except Exception as e:
-            self.log_message(f"Error restoring bot state: {e}")
-        
-        # refresh bot status regularly
-        self.set_interval(5, self.update_bots_table)
-        
-        # start balance sync
-        self.run_worker(test_connection, thread=True)
-        self.run_worker(self._sync_worker, thread=True)
-        self.set_interval(10, lambda: self.run_worker(self._sync_worker, thread=True))
-        
-        # initialize status strip
-        try:
-            self.query_one("#status-strip", Static).update("Ready")
-            self.log_message("Status strip initialized")
-        except Exception as e:
-            self.log_message(f"Error initializing status strip: {e}")
-        
-        self.log_message("System V5.0 Online. Initializing Sync...")
-    
-    def _sync_worker(self):
-        """Background worker for syncing balance."""
-        try:
-            # Sync Balance
-            b_path = "/trade-api/v2/portfolio/balance"
-            base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
-            url = base_url + b_path
-            
-            res = requests.get(url, headers=get_kalshi_headers("GET", b_path), timeout=2)
-            
-            if res.status_code == 200:
-                bal = res.json().get('balance', 0) / 100
-                self.call_from_thread(self._update_balance_panel, f"💰 Kalshi Balance: ${bal:.2f}")
-                self.call_from_thread(self.log_message, "✅ Synced OK")
-            else:
-                self.call_from_thread(self.log_message, f"❌ API {res.status_code} - Auth failed")
-                self.call_from_thread(self._update_balance_panel, f"⚠️ Error {res.status_code}")
-                
-        except requests.exceptions.Timeout:
-            self.call_from_thread(self.log_message, "⏱️ Sync timeout")
-        except requests.exceptions.ConnectionError:
-            self.call_from_thread(self.log_message, "🔌 Connection failed")
-        except Exception as e:
-            error_msg = f"❌ {type(e).__name__}: {str(e)[:40]}"
-            self.call_from_thread(self.log_message, error_msg)
-    
-    def _update_balance_panel(self, text: str):
-        """Thread-safe way to update balance panel."""
-        try:
-            self.query_one("#balance-panel", Static).update(text)
-        except Exception as e:
-            self.log_message(f"Error updating balance: {e}")
-    
-    def update_bots_table(self) -> None:
-        """Update bots table with current status"""
-        try:
-            bots_table = self.query_one("#bots_table", DataTable)
-            
-            # Debug: log the update
-            self.log_message(f"Updating bots table with {len(BOT_SCRIPTS)} bots")
-            
-            # Build rows
-            rows = []
-            for key, script in BOT_SCRIPTS.items():
-                proc = self.bots.get(key)
-                if proc and proc.poll() is None:
-                    status = "running"
-                    pid = str(proc.pid)
-                else:
-                    status = "stopped"
-                    pid = "-"
-                rows.append((key, script, status, pid))
-                self.log_message(f"Bot: {key} ({script}) - Status: {status}")
 
-            # Clear and repopulate table
-            bots_table.clear()
-            for key, script, status, pid in rows:
-                bots_table.add_row(script, status, pid)
-            
-            self.log_message(f"Updated bots table with {len(BOT_SCRIPTS)} bots")
-            
+        # Init bots table
+        bt = self.query_one("#bots_table", DataTable)
+        bt.add_columns("Bot", "Status", "PID")
+
+        # Init opportunities table
+        ot = self.query_one("#opp_table", DataTable)
+        ot.add_columns("Ticker", "Gap", "Best Side", "Ask", "Mins Left")
+
+        self.log_msg("Command Center online.")
+        self.update_bots_table()
+
+        # Restore previously running bots
+        for key, running in load_state().items():
+            if running and key in BOT_SCRIPTS:
+                self.log_msg(f"🔁 Restoring: {key}")
+                self.start_bot(key)
+
+        # Timers
+        self.set_interval(5,  self.update_bots_table)
+        self.set_interval(10, self._refresh_balance)
+        self.set_interval(15, self._refresh_opportunities)
+        self._refresh_balance()
+        self._refresh_opportunities()
+
+    # ── Balance ──────────────────────────────────────────────────────────
+
+    def _refresh_balance(self):
+        self.run_worker(self._fetch_balance, thread=True)
+
+    def _fetch_balance(self):
+        try:
+            path = "/trade-api/v2/portfolio/balance"
+            res = requests.get(
+                BASE_URL + path,
+                headers=get_kalshi_headers("GET", path),
+                timeout=5,
+            )
+            if res.status_code == 200:
+                bal = res.json().get("balance", 0) / 100
+                self.call_from_thread(
+                    self.query_one("#header-bar", Static).update,
+                    f"💰 Kalshi Balance: ${bal:.2f}",
+                )
+                self.call_from_thread(self.log_msg, f"Balance synced: ${bal:.2f}")
+            else:
+                self.call_from_thread(self.log_msg, f"⚠️ Balance API {res.status_code}")
         except Exception as e:
-            self.log_message(f"Error updating bots table: {e}")
-    
-    # ---- Bot process control ----
-    def start_bot(self, key: str) -> None:
-        """Start a bot script if not already running."""
+            self.call_from_thread(self.log_msg, f"Balance error: {e}")
+
+    # ── Opportunities ─────────────────────────────────────────────────────
+
+    def _refresh_opportunities(self):
+        self.run_worker(self._fetch_opportunities, thread=True)
+
+    def _fetch_opportunities(self):
+        try:
+            opps = find_opportunities(min_gap=2, max_ask=50)
+            self.call_from_thread(self._update_opp_table, opps)
+            if opps:
+                top = opps[0]
+                self.call_from_thread(
+                    self.log_msg,
+                    f"🎯 Best opp: {top['ticker']} gap={top['_gap']}¢ {top['_best_side']}@{top['_best_ask']}¢",
+                )
+        except Exception as e:
+            self.call_from_thread(self.log_msg, f"Opp scan error: {e}")
+
+    def _update_opp_table(self, opps: list):
+        ot = self.query_one("#opp_table", DataTable)
+        ot.clear()
+        for o in opps[:8]:
+            ot.add_row(
+                o["ticker"][-25:],
+                f"{o['_gap']}¢",
+                o["_best_side"].upper(),
+                f"{o['_best_ask']}¢",
+                str(o["_mins_left"]) if o["_mins_left"] is not None else "?",
+            )
+
+    # ── Bots table ────────────────────────────────────────────────────────
+
+    def update_bots_table(self):
+        bt = self.query_one("#bots_table", DataTable)
+        bt.clear()
+        for key, script in BOT_SCRIPTS.items():
+            proc = self.bots.get(key)
+            if proc and proc.poll() is None:
+                status = "🟢 running"
+                pid = str(proc.pid)
+            else:
+                status = "⚫ stopped"
+                pid = "—"
+            bt.add_row(BOT_LABELS[key], status, pid)
+
+    # ── Bot lifecycle ─────────────────────────────────────────────────────
+
+    def start_bot(self, key: str):
         if key not in BOT_SCRIPTS:
-            self.log_message(f"❌ Unknown bot key: {key}")
+            return
+        proc = self.bots.get(key)
+        if proc and proc.poll() is None:
+            self.log_msg(f"⚠️ {key} already running (PID {proc.pid})")
             return
 
-        if key in self.bots:
-            proc = self.bots[key]
-            if proc.poll() is None:
-                self.log_message(f"⚠️ Bot {key} already running (PID {proc.pid})")
-                return
-
         script = BOT_SCRIPTS[key]
-        script_path = os.path.join(os.getcwd(), script)
+        script_path = os.path.join(os.path.dirname(__file__), script)
+        log_path = script.replace(".py", ".log")
         try:
-            # Create log file for this bot if it doesn't exist
-            log_file = script.replace('.py', '.log')
-            
-            # Start bot with output redirected to log file (not DEVNULL)
-            with open(log_file, 'a') as log_f:
-                proc = subprocess.Popen([self.python_exe, script_path], 
-                                      stdout=log_f, stderr=log_f)
+            with open(log_path, "a") as lf:
+                proc = subprocess.Popen(
+                    [self.python_exe, script_path],
+                    stdout=lf, stderr=lf,
+                    cwd=os.path.dirname(__file__),
+                )
             self.bots[key] = proc
-            self.log_message(f"🚀 Started {script} (PID {proc.pid}) - Log: {log_file}")
+            self.log_msg(f"🚀 Started {script} (PID {proc.pid})")
             self.update_bots_table()
-            
-            # Start a worker to monitor the bot's log file
-            self.run_worker(lambda: self._monitor_bot_log(key), thread=True)
-            
-            # persist state
-            try:
-                st = load_state()
-                st[key] = True
-                save_state(st)
-            except Exception:
-                pass
+            self.run_worker(lambda k=key: self._tail_bot_log(k), thread=True)
+            st = load_state(); st[key] = True; save_state(st)
         except Exception as e:
-            self.log_message(f"❌ Failed to start {script}: {e}")
+            self.log_msg(f"❌ Failed to start {key}: {e}")
 
-    def _monitor_bot_log(self, key: str):
-        """Monitor a bot's log file and stream output to main log."""
-        script = BOT_SCRIPTS[key]
-        log_file = script.replace('.py', '.log')
-        
-        # Wait a bit for the log file to be created
-        time.sleep(1)
-        
-        try:
-            if os.path.exists(log_file):
-                # Get current size
-                last_size = os.path.getsize(log_file)
-                
-                # Monitor for new content
-                while key in self.bots and self.bots[key].poll() is None:
-                    try:
-                        current_size = os.path.getsize(log_file)
-                        if current_size > last_size:
-                            with open(log_file, 'r', encoding='utf-8') as f:
-                                f.seek(last_size)
-                                new_lines = f.readlines()
-                                for line in new_lines:
-                                    self.call_from_thread(self.log_message, f"🤖 {script}: {line.strip()}")
-                            last_size = current_size
-                        time.sleep(2)  # Check every 2 seconds
-                    except Exception as e:
-                        self.call_from_thread(self.log_message, f"❌ Error monitoring {script} log: {e}")
-                        break
-        except Exception as e:
-            self.call_from_thread(self.log_message, f"❌ Failed to monitor {script} log: {e}")
-
-    def stop_bot(self, key: str) -> None:
-        """Stop a running bot by key."""
-        proc = self.bots.get(key)
+    def stop_bot(self, key: str):
+        proc = self.bots.pop(key, None)
         if not proc:
-            self.log_message(f"⚠️ Bot {key} not running")
+            self.log_msg(f"⚠️ {key} not running")
             return
         try:
             proc.terminate()
             proc.wait(timeout=5)
-            self.log_message(f"🛑 Stopped {key} (PID {proc.pid})")
+            self.log_msg(f"🛑 Stopped {key} (PID {proc.pid})")
         except Exception:
             try:
                 proc.kill()
-                self.log_message(f"💀 Killed {key} (PID {proc.pid})")
+                self.log_msg(f"💀 Killed {key}")
             except Exception as e:
-                self.log_message(f"❌ Failed to stop {key}: {e}")
-        finally:
-            self.bots.pop(key, None)
-            self.update_bots_table()
-            # persist state
-            try:
-                st = load_state()
-                st[key] = False
-                save_state(st)
-            except Exception:
-                pass
-    
-    def log_message(self, message: str):
-        """Log message to main log"""
+                self.log_msg(f"❌ Kill failed: {e}")
+        self.update_bots_table()
+        st = load_state(); st[key] = False; save_state(st)
+
+    def stop_all_bots(self):
+        self.log_msg("⛔ Stopping all bots…")
+        for key in list(self.bots.keys()):
+            self.stop_bot(key)
+
+    def _tail_bot_log(self, key: str):
+        """Tail a bot's log file into the scanner feed."""
+        script = BOT_SCRIPTS[key]
+        log_path = os.path.join(os.path.dirname(__file__), script.replace(".py", ".log"))
+        time.sleep(1)
         try:
-            self.query_one("#main_log", Log).write_line(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-            # update status strip with a concise last-action message
-            try:
-                short = message if len(message) <= 80 else message[:77] + "..."
-                status_strip = self.query_one("#status-strip", Static)
-                status_strip.update(f"{datetime.now().strftime('%H:%M:%S')} {short}")
-            except Exception:
-                pass
+            last_size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+            while key in self.bots and self.bots[key].poll() is None:
+                current_size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+                if current_size > last_size:
+                    with open(log_path, "r", encoding="utf-8") as f:
+                        f.seek(last_size)
+                        for line in f.readlines():
+                            line = line.strip()
+                            if line:
+                                self.call_from_thread(self._append_scanner_log, f"[{key}] {line}")
+                    last_size = current_size
+                time.sleep(2)
         except Exception as e:
-            print(f"Error logging message: {e}")
+            self.call_from_thread(self.log_msg, f"Log tail error ({key}): {e}")
+
+    def _append_scanner_log(self, text: str):
+        self.query_one("#scanner_log", Log).write_line(text)
+
+    # ── Logging ───────────────────────────────────────────────────────────
+
+    def log_msg(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        full = f"[{ts}] {msg}"
+        try:
+            self.query_one("#main_log", Log).write_line(full)
+            short = msg[:90] if len(msg) > 90 else msg
+            self.query_one("#status-bar", Static).update(f"{ts} {short}")
+        except Exception:
+            pass
+
+    # ── Button handler ────────────────────────────────────────────────────
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle button press events"""
-        bid = event.button.id
-        
-        # Handle action buttons
-        if bid == "btn_refresh":
-            self.log_message("🔄 Manual refresh triggered...")
-            self.run_worker(self._sync_worker, thread=True)
-        elif bid == "btn_snipe":
-            self.start_bot("scanner")
-        elif bid == "btn_stop":
-            self.log_message("� Stop all bots requested...")
-        elif bid == "btn_logs":
-            self.show_bot_logs()
-        elif bid == "btn_monitor":
-            self.start_real_time_monitor()
-        
-        # Handle bot start/stop buttons
-        elif bid and bid.startswith("start_"):
-            key = bid.split("start_", 1)[1]
-            self.start_bot(key)
-        elif bid and bid.startswith("stop_"):
-            key = bid.split("stop_", 1)[1]
-            self.stop_bot(key)
-    
-    def show_bot_logs(self) -> None:
-        """Show bot logs in the main log"""
-        self.log_message("📋 === BOT LOGS ===")
-        
-        for key, script in BOT_SCRIPTS.items():
-            log_file = script.replace('.py', '.log')
-            try:
-                if os.path.exists(log_file):
-                    with open(log_file, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()[-5:]  # Last 5 lines
-                        if lines:
-                            self.log_message(f"📄 {script} (last 5 lines):")
-                            for line in lines:
-                                self.log_message(f"   {line.strip()}")
-                        else:
-                            self.log_message(f"📄 {script}: Empty log")
-                else:
-                    self.log_message(f"📄 {script}: No log file")
-            except Exception as e:
-                self.log_message(f"❌ Error reading {script} log: {e}")
-        
-        self.log_message("📋 === END LOGS ===")
-    
-    def start_real_time_monitor(self) -> None:
-        """Start real-time monitoring of all running bots."""
-        self.log_message("🔍 === REAL-TIME BOT MONITOR ===")
-        
-        running_bots = []
-        for key, proc in self.bots.items():
-            if proc.poll() is None:
-                running_bots.append(key)
-                self.log_message(f"🤖 {BOT_SCRIPTS[key]} is running (PID: {proc.pid})")
-        
-        if not running_bots:
-            self.log_message("⚠️ No bots are currently running")
-        else:
-            self.log_message(f"📊 Monitoring {len(running_bots)} running bots...")
-            
-            # Start log monitoring for each running bot
-            for key in running_bots:
-                self.run_worker(lambda k=key: self._monitor_bot_log(k), thread=True)
-        
-        self.log_message("🔍 === END MONITOR SETUP ===")
+        bid = event.button.id or ""
+        if bid.startswith("start_"):
+            self.start_bot(bid[6:])
+        elif bid.startswith("stop_") and bid != "btn_stop_all":
+            self.stop_bot(bid[5:])
+        elif bid == "btn_stop_all":
+            self.stop_all_bots()
+        elif bid == "btn_refresh":
+            self._refresh_balance()
+            self._refresh_opportunities()
+            self.update_bots_table()
+            self.log_msg("Manual refresh triggered.")
+
 
 if __name__ == "__main__":
-    app = KalshiDashboard()
-    app.run()
+    KalshiCommandCenter().run()
