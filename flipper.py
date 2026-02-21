@@ -271,10 +271,29 @@ def run():
 
     while True:
         try:
-            markets = get_markets_closing_soon(MAX_SECS_LEFT)
             ts = datetime.now().strftime("%H:%M:%S")
 
-            for m in markets:
+            # Always check BTC/ETH 15-min directly first
+            priority_markets = []
+            for series in ["KXBTC15M", "KXETH15M"]:
+                path = f"/trade-api/v2/markets?series_ticker={series}&status=open&limit=1"
+                try:
+                    res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=8)
+                    if res.status_code == 200:
+                        ms = res.json().get("markets", [])
+                        if ms:
+                            priority_markets.append(ms[0])
+                except:
+                    pass
+
+            # Also sweep other closing-soon markets
+            sweep = get_markets_closing_soon(MAX_SECS_LEFT)
+            all_markets = {m["ticker"]: m for m in priority_markets + sweep}.values()
+
+            print(f"[{ts}] Scanning {len(list(all_markets))} markets...")
+            all_markets = {m["ticker"]: m for m in priority_markets + sweep}.values()
+
+            for m in all_markets:
                 ticker = m["ticker"]
                 sl = secs_left(m.get("close_time", ""))
                 if sl is None or sl <= 0:
