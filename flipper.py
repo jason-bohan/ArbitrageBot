@@ -18,11 +18,12 @@ load_dotenv()
 
 BASE_URL          = "https://api.elections.kalshi.com"
 COINGECKO_URL     = "https://api.coingecko.com/api/v3/simple/price"
-STOP_LOSS_CENTS   = 2
+STOP_LOSS_CENTS   = 4    # wider stop to handle spread + volatility
 TAKE_PROFIT_CENTS = 3
-MAX_ENTRY_PRICE   = 75   # don't enter if side already > 75c
-MIN_SECS_LEFT     = 120  # scalp window: last 2 min
+MAX_ENTRY_PRICE   = 70   # don't enter if side already > 70c
+MIN_SECS_LEFT     = 300  # NEVER enter with less than 5 min left (last 2 min are too wild)
 MAX_SECS_LEFT     = 780  # flipper entry: up to 13 min before close
+MAX_FLIPS         = 2    # max flips before bailing — avoid runaway losses
 CONTRACTS         = 1
 AUTO_TRADE        = os.getenv("AUTO_TRADE", "true").lower() == "true"
 TELEGRAM_TOKEN    = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
@@ -193,6 +194,10 @@ def trade_market(market):
         return
 
     sl = secs_left(market["close_time"])
+    if sl is None or sl < MIN_SECS_LEFT:
+        print(f"  Skip {ticker}: only {sl:.0f}s left — too close to expiry")
+        return
+
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{ts}] 🎯 {ticker} | {side.upper()} @ {entry_price}c | {signal} | {sl:.0f}s left")
 
@@ -236,6 +241,15 @@ def trade_market(market):
             loss = entry - bid
             total_loss += loss
             flips += 1
+
+            # Bail after max flips — cut losses
+            if flips > MAX_FLIPS:
+                print(f"  [{ts}] 🛑 Max flips hit — exiting. Total loss: {total_loss}c")
+                if AUTO_TRADE:
+                    place_order(ticker, side, bid, CONTRACTS, action="sell")
+                tg(f"🛑 Max flips on `{ticker}` | Exiting | Total loss: {total_loss}c")
+                break
+
             new_side = "no" if side == "yes" else "yes"
             new_price = m.get("yes_ask" if new_side == "yes" else "no_ask", 50)
 
