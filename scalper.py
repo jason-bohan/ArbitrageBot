@@ -27,6 +27,11 @@ RISK_PCT_NORMAL   = 0.10  # risk 10% on normal trades
 MAX_CONTRACTS     = 10    # hard cap
 AUTO_TRADE        = os.getenv("AUTO_TRADE", "true").lower() == "true"
 
+# Reversal detection: if a side drops this many cents in this many seconds → buy opposite
+REVERSAL_DROP     = 10    # cents dropped triggers reversal signal
+REVERSAL_WINDOW   = 45    # seconds to look back
+REVERSAL_MIN_PRICE = 60   # only watch for reversals when side was at least this high
+
 TELEGRAM_TOKEN = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
 JASON_CHAT_ID  = "7478453115"
 
@@ -149,6 +154,39 @@ def evaluate_trade(market, live_price):
     return None
 
 
+def check_reversal(ticker, price_history):
+    """
+    Detect rapid price collapse. If YES dropped REVERSAL_DROP+ cents in REVERSAL_WINDOW secs
+    from a high of REVERSAL_MIN_PRICE+, return ('no', drop_amount). Vice versa for NO.
+    """
+    history = price_history.get(ticker, [])
+    if len(history) < 2:
+        return None
+
+    now = time.time()
+    recent = [(t, ya, na) for t, ya, na in history if now - t <= REVERSAL_WINDOW]
+    if len(recent) < 2:
+        return None
+
+    oldest_ya = recent[0][1]
+    oldest_na = recent[0][2]
+    latest_ya = recent[-1][1]
+    latest_na = recent[-1][2]
+
+    ya_drop = oldest_ya - latest_ya
+    na_drop = oldest_na - latest_na
+
+    # YES collapsing from high → buy NO
+    if oldest_ya >= REVERSAL_MIN_PRICE and ya_drop >= REVERSAL_DROP:
+        return ("no", ya_drop, oldest_ya, latest_ya)
+
+    # NO collapsing from high → buy YES
+    if oldest_na >= REVERSAL_MIN_PRICE and na_drop >= REVERSAL_DROP:
+        return ("yes", na_drop, oldest_na, latest_na)
+
+    return None
+
+
 def get_all_closing_soon():
     """Sweep ALL open markets closing within SCALP_WINDOW seconds."""
     from datetime import timedelta
@@ -254,6 +292,7 @@ def scan_loop():
 
     traded_tickers = set()
     last_status = 0
+    price_history = {}  # ticker → [(timestamp, yes_ask, no_ask), ...]
 
     while True:
         try:
@@ -287,9 +326,48 @@ def scan_loop():
             # Check each market
             for ticker, (market, coin_id) in all_markets.items():
                 secs = seconds_to_close(market.get("close_time", ""))
-                if secs is None or not (0 < secs <= SCALP_WINDOW):
+                if secs is None or secs <= 0:
                     continue
+
+                ya = market.get("yes_ask", 0)
+                na = market.get("no_ask", 0)
+
+                # Always track price history for reversal detection
+                if ya and na and secs <= SCALP_WINDOW * 2:
+                    if ticker not in price_history:
+                        price_history[ticker] = []
+                    price_history[ticker].append((now_epoch, ya, na))
+                    # Keep only last 2 minutes of history
+                    price_history[ticker] = [(t, y, n) for t, y, n in price_history[ticker] if now_epoch - t <= 120]
+
                 if ticker in traded_tickers:
+                    continue
+
+                # Check for reversal signal (rapid collapse of leading side)
+                if secs <= SCALP_WINDOW:
+                    reversal = check_reversal(ticker, price_history)
+                    if reversal:
+                        rev_side, drop, from_price, to_price = reversal
+                        rev_entry = market.get("yes_ask" if rev_side == "yes" else "no_ask", 50)
+                        if rev_entry < 97:
+                            balance = get_balance() or 1
+                            risk_amt = balance * RISK_PCT  # always 25% on reversals
+                            contracts = min(MAX_CONTRACTS, max(1, int(risk_amt / (rev_entry / 100))))
+                            profit_if_wins = (100 - rev_entry) / 100 * contracts
+                            print(f"\n[{ts}] 🔄 REVERSAL: {ticker[-20:]} | {rev_side.upper()} @ {rev_entry}c")
+                            print(f"       Opposite side dropped {drop}c ({from_price}→{to_price}) in {REVERSAL_WINDOW}s")
+                            print(f"       {contracts} contracts | profit if wins: ${profit_if_wins:.2f}")
+                            msg = (f"🔄 *REVERSAL DETECTED*\n`{ticker}`\n"
+                                   f"Opposite dropped {drop}c ({from_price}→{to_price}c)\n"
+                                   f"Buy {rev_side.upper()} @ {rev_entry}c | {contracts} contracts\n"
+                                   f"Profit if wins: ${profit_if_wins:.2f}")
+                            if AUTO_TRADE:
+                                ok, result = place_order(ticker, rev_side, rev_entry, count=contracts)
+                                tg(msg + ("\n✅ Placed!" if ok else f"\n❌ {result}"))
+                            traded_tickers.add(ticker)
+                            continue
+
+                if not (0 < secs <= SCALP_WINDOW):
                     continue
 
                 live_price = live_prices.get(ticker)
