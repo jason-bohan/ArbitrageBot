@@ -28,6 +28,8 @@ BOT_SCRIPTS = {
     "pairs":           "KalshiPairs.py",
     "profit_max":      "ProfitMaximizer.py",
     "snipe":           "KalshiManTargetSnipe.py",
+    "scalper":         "scalper.py",
+    "flipper":         "flipper.py",
 }
 
 BOT_LABELS = {
@@ -37,6 +39,8 @@ BOT_LABELS = {
     "pairs":         "🔗 Pairs",
     "profit_max":    "💰 Profit Max",
     "snipe":         "🎯 Target Snipe",
+    "scalper":       "⚡ Scalper",
+    "flipper":       "🔄 Flipper",
 }
 
 
@@ -63,7 +67,11 @@ class KalshiCommandCenter(App):
     #center-panel { width: 1fr; }
     #right-panel { width: 50; }
 
-    DataTable { background: #24283b; height: 12; }
+    DataTable { 
+        background: #24283b; 
+        height: 12; 
+        overflow: auto;
+    }
     DataTable > .datatable--cursor { background: #7aa2f7; color: #1a1b26; }
     DataTable > .datatable--header { background: #1f2335; color: #7aa2f7; text-style: bold; }
 
@@ -80,6 +88,7 @@ class KalshiCommandCenter(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static("💰 Connecting…", id="header-bar")
+        yield Static("j/k: ↑↓ | h/l: ←→ | g/G: top/bottom | Enter: Select | q: Quit", id="help-bar")
 
         with Horizontal():
             # LEFT: Bot controls
@@ -106,23 +115,43 @@ class KalshiCommandCenter(App):
                 yield Label("📡 SCANNER FEED", classes="panel-title")
                 yield Log(id="scanner_log")
 
-        yield Static("Initializing…", id="status-bar")
+        yield Static("Initializing…", id="init-status")
         yield Footer()
 
     def on_mount(self) -> None:
         self.python_exe = sys.executable
         self.bots: dict[str, subprocess.Popen] = {}
+        
+        # Set up Vim key bindings
+        self.bind("j", "cursor_down")
+        self.bind("k", "cursor_up") 
+        self.bind("h", "cursor_left")
+        self.bind("l", "cursor_right")
+        self.bind("g", "home")
+        self.bind("G", "end")
+        self.bind("q", "quit")
+        self.bind("ctrl+c", "quit")
 
         # Init bots table
         bt = self.query_one("#bots_table", DataTable)
         bt.add_columns("Bot", "Status", "PID")
+        
+        # Add initial data
+        for key, script in BOT_SCRIPTS.items():
+            bt.add_row(BOT_LABELS[key], "Stopped", "-")
 
         # Init opportunities table
         ot = self.query_one("#opp_table", DataTable)
         ot.add_columns("Ticker", "Gap", "Best Side", "Ask", "Mins Left")
+        
+        # Add sample data
+        ot.add_row("KXETH15M-26FEB191215", "3¢", "YES", "48¢", "15")
 
         self.log_msg("Command Center online.")
         self.update_bots_table()
+        
+        # Update the init status to show we're ready
+        self.query_one("#init-status", Static).update("Ready - Use j/k/h/l to navigate")
 
         # Restore previously running bots
         for key, running in load_state().items():
