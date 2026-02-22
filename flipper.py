@@ -18,12 +18,14 @@ load_dotenv()
 
 BASE_URL          = "https://api.elections.kalshi.com"
 COINGECKO_URL     = "https://api.coingecko.com/api/v3/simple/price"
-STOP_LOSS_CENTS   = 4    # wider stop to handle spread + volatility
-TAKE_PROFIT_CENTS = 3
-MAX_ENTRY_PRICE   = 65   # don't enter if side already > 65c
+STOP_LOSS_CENTS   = 3    # tighter stop
+TAKE_PROFIT_CENTS = 4    # higher target to cover spread
+MAX_ENTRY_PRICE   = 55   # stricter entry price
 MIN_SECS_LEFT     = 300  # NEVER enter with less than 5 min left
 MAX_SECS_LEFT     = 840  # flipper entry: up to 14 min before close
-MAX_FLIPS         = 2    # max flips before bailing
+MAX_FLIPS         = 1    # max 1 flip — reversal is usually wrong
+MIN_OBIT_TO_FLIP  = 0.15 # require stronger OBI to flip
+MIN_GAP_TO_FLIP   = 3    # require 3¢ gap to consider flip
 CONTRACTS         = 1
 FORCE_ENTRY_PRICE = 55   # if either side is <= this with no signal, enter anyway
 AUTO_TRADE        = os.getenv("AUTO_TRADE", "true").lower() == "true"
@@ -193,8 +195,53 @@ def refresh_market(ticker):
     return {}
 
 
+def should_flip(market, current_side, current_obi):
+    """
+    SMARTER REVERSAL: Only flip if there's actual evidence the market reversed.
+    Returns (new_side, reason) or (None, None) if shouldn't flip.
+    """
+    new_side = "no" if current_side == "yes" else "yes"
+    
+    # Get fresh orderbook for BOTH sides
+    ob = get_orderbook(market["ticker"])
+    new_obi = calculate_obi(ob)
+    
+    # Check OBI reversal — require stronger signal
+    obi_reversed = (current_obi > 0 and new_obi < 0) or (current_obi < 0 and new_obi > 0)
+    obi_stronger = abs(new_obi) > abs(current_obi) + 0.05
+    
+    # Check price action
+    ya = market.get("yes_ask", 50)
+    yb = market.get("yes_bid", 50)
+    na = market.get("no_ask", 50)
+    nb = market.get("no_bid", 50)
+    
+    yes_mid = (ya + yb) / 2
+    no_mid = (na + nb) / 2
+    
+    # Price reversed significantly?
+    if current_side == "yes":
+        price_reversed = no_mid > yes_mid + MIN_GAP_TO_FLIP
+    else:
+        price_reversed = yes_mid > no_mid + MIN_GAP_TO_FLIP
+    
+    # Check spread on new side (don't flip into illiquidity)
+    new_spread = (na - nb) if new_side == "no" else (ya - yb)
+    if new_spread > 4:
+        return None, f"new_side_spread_too_wide({new_spread}c)"
+    
+    # Only flip if OBI strongly reversed AND price action confirms
+    if obi_reversed and (abs(new_obi) >= MIN_OBIT_TO_FLIP or price_reversed):
+        reason = f"OBI_reversal:{current_obi:+.2f}→{new_obi:+.2f}"
+        if price_reversed:
+            reason += f" price_confirm"
+        return new_side, reason
+    
+    return None, "no_confirmation"
+
+
 def trade_market(market):
-    """Enter and manage one market with flip logic."""
+    """Enter and manage one market with SMARTER flip logic."""
     ticker = market["ticker"]
     ob = get_orderbook(ticker)
     side, entry_price, signal = pick_side(market, ob)
@@ -222,6 +269,7 @@ def trade_market(market):
     tg(f"🎯 *Flipper entered* `{ticker}`\n{side.upper()} @ {entry_price}c | {signal} | {sl:.0f}s left")
 
     entry = entry_price
+    current_obi = calculate_obi(ob)
     total_loss = 0
     flips = 0
 
@@ -262,10 +310,19 @@ def trade_market(market):
                 tg(f"🛑 Max flips on `{ticker}` | Exiting | Total loss: {total_loss}c")
                 break
 
-            new_side = "no" if side == "yes" else "yes"
+            # SMARTER REVERSAL: Check if reversal is actually confirmed
+            new_side, flip_reason = should_flip(m, side, current_obi)
+            
+            if new_side is None:
+                print(f"  [{ts}] 🛑 Stop -{loss}c | No reversal confirmation ({flip_reason})")
+                if AUTO_TRADE:
+                    place_order(ticker, side, bid, CONTRACTS, action="sell")
+                tg(f"🛑 *Flipper stop* `{ticker}` -{loss}c | No flip: {flip_reason}")
+                break
+            
             new_price = m.get("yes_ask" if new_side == "yes" else "no_ask", 50)
 
-            print(f"  [{ts}] 🔄 Flip #{flips} | -{loss}c | → {new_side.upper()} @ {new_price}c | total loss: {total_loss}c")
+            print(f"  [{ts}] 🔄 Flip #{flips} | -{loss}c | → {new_side.upper()} @ {new_price}c | reason: {flip_reason}")
 
             if AUTO_TRADE:
                 place_order(ticker, side, bid, CONTRACTS, action="sell")
@@ -276,12 +333,13 @@ def trade_market(market):
                     tg(f"❌ Flip failed `{ticker}`: {err}")
                     break
 
-            tg(f"🔄 *Flip #{flips}* `{ticker}` | -{loss}c | → {new_side.upper()} @ {new_price}c")
-            side  = new_side
+            tg(f"🔄 *Flip #{flips}* `{ticker}` | -{loss}c | → {new_side.upper()} @ {new_price}c | {flip_reason}")
+            side = new_side
             entry = new_price
+            current_obi = calculate_obi(get_orderbook(ticker))
         else:
             if int(time.time()) % 20 == 0:
-                print(f"  [{ts}] {side.upper()} {pnl:+}c | {sl:.0f}s left")
+                print(f"  [{ts}] {side.upper()} {pnl:+}c | {sl:.0f}s left | OBI: {current_obi:+.2f}")
 
 
 def run():
