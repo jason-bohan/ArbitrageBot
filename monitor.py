@@ -16,9 +16,9 @@ load_dotenv()
 TELEGRAM_TOKEN = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
 JASON_CHAT_ID  = "7478453115"
 SCANNER_DIR    = "/home/jasonbohan2/ArbitrageBot"
-SCANNER_SCRIPT = "arb_scanner.py"
-SCANNER_LOG    = os.path.join(SCANNER_DIR, "scanner.log")
-PID_FILE       = os.path.join(SCANNER_DIR, "scanner.pid")
+SCANNER_SCRIPT = "profit_bot.py"
+SCANNER_LOG    = os.path.join(SCANNER_DIR, "profit_bot.log")
+PID_FILE       = os.path.join(SCANNER_DIR, "profit_bot.pid")
 
 CHECK_INTERVAL  = 15 * 60   # 15 minutes in seconds
 UPDATE_INTERVAL = 30 * 60   # 30 minutes in seconds
@@ -37,10 +37,10 @@ def tg(msg):
 
 
 def get_scanner_pid():
-    """Find running arb_scanner.py PID."""
+    """Find running profit_bot.py PID."""
     try:
         result = subprocess.run(
-            ["pgrep", "-f", "arb_scanner.py"],
+            ["pgrep", "-f", "profit_bot.py"],
             capture_output=True, text=True
         )
         pids = result.stdout.strip().split()
