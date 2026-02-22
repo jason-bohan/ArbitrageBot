@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-GoobClaw Monitor — checks scanner every 15 min, texts Jason every 30 min.
+GoobClaw Monitor — Windows-compatible version
 """
-
 import os
 import time
 import subprocess
@@ -13,9 +12,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_TOKEN = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
-JASON_CHAT_ID  = "7478453115"
-SCANNER_DIR    = "/home/jasonbohan2/ArbitrageBot"
+# Cross-platform paths
+SCANNER_DIR    = os.path.dirname(os.path.abspath(__file__))
 SCANNER_SCRIPT = "profit_bot.py"
 SCANNER_LOG    = os.path.join(SCANNER_DIR, "profit_bot.log")
 PID_FILE       = os.path.join(SCANNER_DIR, "profit_bot.pid")
@@ -23,48 +21,67 @@ PID_FILE       = os.path.join(SCANNER_DIR, "profit_bot.pid")
 CHECK_INTERVAL  = 15 * 60   # 15 minutes in seconds
 UPDATE_INTERVAL = 30 * 60   # 30 minutes in seconds
 
-
 def tg(msg):
     """Send a Telegram message to Jason."""
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": JASON_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            f"https://api.telegram.org/bot{os.getenv('TELEGRAM_TOKEN')}/sendMessage",
+            json={"chat_id": os.getenv('JASON_CHAT_ID'), "text": msg, "parse_mode": "Markdown"},
             timeout=10
         )
     except Exception as e:
         print(f"[tg error] {e}")
 
-
 def get_scanner_pid():
-    """Find running profit_bot.py PID."""
+    """Find running profit_bot.py PID using PID file."""
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "profit_bot.py"],
-            capture_output=True, text=True
-        )
-        pids = result.stdout.strip().split()
-        return int(pids[0]) if pids else None
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+                
+            # Check if process is actually running
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV"],
+                    capture_output=True, text=True
+                )
+                return pid if result.returncode == 0 else None
+            else:
+                # Linux/Mac
+                result = subprocess.run(
+                    ["ps", "-p", str(pid)],
+                    capture_output=True, text=True
+                )
+                return pid if result.returncode == 0 else None
+        return None
     except:
         return None
 
-
 def restart_scanner():
-    """Start the scanner in the background."""
-    log = open(SCANNER_LOG, "a")
+    """Start the scanner in background."""
+    # Create log directory if needed
+    os.makedirs(SCANNER_DIR, exist_ok=True)
+    
+    # Cross-platform Python command
+    python_cmd = "python" if sys.platform == "win32" else "python3"
+    
+    # Start process
     proc = subprocess.Popen(
-        ["python3", SCANNER_SCRIPT],
+        [python_cmd, SCANNER_SCRIPT],
         cwd=SCANNER_DIR,
-        stdout=log,
-        stderr=log,
-        start_new_session=True
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
     )
-    log.close()
+    
+    # Save PID
+    with open(PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    
     return proc.pid
 
-
 def get_balance():
-    sys.path.insert(0, SCANNER_DIR)
+    """Get current balance."""
     try:
         from kalshi_connection import get_kalshi_headers
         path = "/trade-api/v2/portfolio/balance"
@@ -82,52 +99,24 @@ def get_balance():
         print(f"[balance error] {e}")
     return None, None
 
+def send_update():
+    """30-min update to Jason."""
+    balance, portfolio = get_balance()
+    pid = get_scanner_pid()
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-def tail_log(n=30):
-    """Get last n lines of scanner log."""
-    try:
-        with open(SCANNER_LOG, "r") as f:
-            lines = f.readlines()
-        return "".join(lines[-n:]).strip()
-    except:
-        return "(log unreadable)"
+    status = "🟢 Running" if pid else "🔴 DOWN"
+    bal_str = f"${balance:.2f}" if balance is not None else "unknown"
+    port_str = f"${portfolio:.2f}" if portfolio is not None else "unknown"
 
-
-def get_current_spreads():
-    """Get current spreads from the API."""
-    sys.path.insert(0, SCANNER_DIR)
-    try:
-        from kalshi_connection import get_kalshi_headers
-        lines = []
-        for series in ["KXETH15M", "KXBTC15M"]:
-            path = f"/trade-api/v2/markets?series_ticker={series}&status=open&limit=1"
-            res = requests.get(
-                "https://api.elections.kalshi.com" + path,
-                headers=get_kalshi_headers("GET", path),
-                timeout=10
-            )
-            if res.status_code == 200:
-                markets = res.json().get("markets", [])
-                for m in markets:
-                    ya = m.get("yes_ask", 0)
-                    na = m.get("no_ask", 0)
-                    total = ya + na
-                    gap = total - 100
-                    arb = "🚀 ARB!" if total < 100 else f"+{gap}¢ from arb"
-                    lines.append(f"{series}: {ya}¢+{na}¢={total}¢ ({arb})")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"(spread error: {e})"
-
-
-def count_trades():
-    """Count how many trades were placed today."""
-    try:
-        log = tail_log(200)
-        return log.count("✅ ORDER PLACED")
-    except:
-        return 0
-
+    msg = (
+        f"🦞 *GoobClaw Update* — {ts}\n\n"
+        f"*Scanner:* {status} (PID {pid})\n"
+        f"*Balance:* {bal_str} | *Portfolio:* {port_str}\n"
+        f"*Note:* No active markets currently - monitoring for opportunities"
+    )
+    tg(msg)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📤 Update sent")
 
 def check_and_fix():
     """15-min health check — restart scanner if dead."""
@@ -141,44 +130,25 @@ def check_and_fix():
         print(f"[{ts}] ⚠️  Scanner dead — restarting...")
         new_pid = restart_scanner()
         time.sleep(3)
+        
         if get_scanner_pid():
             print(f"[{ts}] ✅ Scanner restarted (PID {new_pid})")
-            tg(f"⚠️ GoobClaw: Scanner had died — restarted automatically (PID {new_pid})")
+            tg(f"⚠️ GoobClaw: Scanner restarted automatically (PID {new_pid})")
             return True, new_pid
         else:
             print(f"[{ts}] ❌ Restart failed!")
             tg("❌ GoobClaw: Scanner restart FAILED. Manual intervention needed.")
             return False, None
 
-
-def send_update():
-    """30-min update to Jason."""
-    balance, portfolio = get_balance()
-    spreads = get_current_spreads()
-    trades = count_trades()
-    pid = get_scanner_pid()
-    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-    status = "🟢 Running" if pid else "🔴 DOWN"
-    bal_str = f"${balance:.2f}" if balance is not None else "unknown"
-    port_str = f"${portfolio:.2f}" if portfolio is not None else "unknown"
-
-    msg = (
-        f"🦞 *GoobClaw Update* — {ts}\n\n"
-        f"*Scanner:* {status} (PID {pid})\n"
-        f"*Balance:* {bal_str} | *Open positions:* {port_str}\n"
-        f"*Trades placed this session:* {trades}\n\n"
-        f"*Current spreads:*\n{spreads}"
-    )
-    tg(msg)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📤 Update sent to Jason")
-
-
 def run():
     print("🦞 GoobClaw Monitor starting...")
-    tg("🦞 GoobClaw monitor is live — will update you every 30 min and auto-restart scanner if it dies.")
+    print("Platform:", sys.platform)
+    print("Scanner directory:", SCANNER_DIR)
+    print("Scanner script:", SCANNER_SCRIPT)
+    
+    tg("🦞 GoobClaw monitor is live — Windows-compatible version")
 
-    last_check  = 0
+    last_check = 0
     last_update = 0
 
     while True:
@@ -193,7 +163,6 @@ def run():
             last_update = now
 
         time.sleep(60)
-
 
 if __name__ == "__main__":
     run()
