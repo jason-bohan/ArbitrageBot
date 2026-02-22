@@ -32,15 +32,21 @@ AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
 # === FIXED PROFIT PARAMETERS ===
 KELLY_FRACTION = 0.25        # Kelly Lite (don't overbet)
 MIN_ARB_PROFIT = 0.50        # $0.50 minimum for arbitrage (after fees)
-MIN_LATE_GAP = 8             # 8¢ gap minimum for late-game (more realistic)
-MAX_TIME_LEFT = 300          # Enter only with <5 min left
-MIN_VOLUME = 10000           # Skip illiquid markets
+MIN_LATE_GAP = 10             # 10¢ gap minimum for late-game (more realistic)
+MAX_TIME_LEFT = 240          # Enter only with <4 min left
+MIN_VOLUME = 5000           # Skip illiquid markets
 BANKROLL_PCT = 0.02          # Max 2% of bankroll per trade
 
-# Fee adjustments (7% total: 2% buy + 5% sell)
-BUY_FEE_PCT = 0.02
-SELL_FEE_PCT = 0.05
-TOTAL_FEE_PCT = 0.07
+# Fee adjustments (ACTUAL KALSHI FEES - ~1.2% average, not 7%!)
+# Kalshi uses probability-based scaling: highest at 50¢, lowest at extremes
+# S&P 500 and Nasdaq-100 get 50% discount
+BUY_FEE_PCT = 0.006   # ~0.6% average (scales with probability)
+SELL_FEE_PCT = 0.006  # ~0.6% average (scales with probability)
+TOTAL_FEE_PCT = 0.012  # ~1.2% total average (NOT 7%!)
+
+
+# Performance tracking
+PERFORMANCE_LOG = "profit_bot_performance.json"
 
 # Position tracking file
 POSITIONS_FILE = "profit_bot_positions.json"
@@ -127,6 +133,94 @@ def save_positions(positions):
         json.dump(positions, f, indent=2)
 
 
+def load_performance():
+    """Load performance tracking data."""
+    try:
+        with open(PERFORMANCE_LOG, "r") as f:
+            return json.load(f)
+    except:
+        return {"arb_trades": 0, "late_trades": 0, "arb_profit": 0, "late_profit": 0}
+
+
+def save_performance(perf):
+    """Save performance tracking data."""
+    with open(PERFORMANCE_LOG, "w") as f:
+        json.dump(perf, f, indent=2)
+
+
+def reconcile_positions():
+    """
+    CRITICAL SAFETY: Compare saved positions with actual portfolio.
+    Prevents position file desync from crashes/restarts.
+    """
+    try:
+        # Get actual portfolio from API
+        path = "/trade-api/v2/portfolio/positions"
+        res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        
+        if res.status_code == 200:
+            actual_positions = {}
+            for pos in res.json().get("positions", []):
+                ticker = pos.get("ticker")
+                if ticker:
+                    actual_positions[ticker] = {
+                        "type": "api_verified",
+                        "count": pos.get("count", 0),
+                        "side": pos.get("side", ""),
+                        "yes_price": pos.get("yes_price", 0)
+                    }
+            
+            # Load our saved positions
+            saved_positions = load_positions()
+            
+            # Check for discrepancies
+            discrepancies = []
+            for ticker, saved_pos in saved_positions.items():
+                if ticker not in actual_positions:
+                    discrepancies.append(f"{ticker}: Saved but not in portfolio")
+                elif saved_pos.get("type") == "arbitrage":
+                    # Arbitrage should have both YES and NO
+                    expected_count = saved_pos.get("pairs", 0) * 2
+                    actual_count = sum(1 for p in res.json().get("positions", []) 
+                                    if p.get("ticker") == ticker)
+                    if actual_count != expected_count:
+                        discrepancies.append(f"{ticker}: Expected {expected_count}, have {actual_count}")
+            
+            if discrepancies:
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"\n[{ts}] ⚠️ POSITION RECONCILIATION ALERT:")
+                for disc in discrepancies:
+                    print(f"   {disc}")
+                tg(f"⚠️ *Position reconciliation needed*\n" + "\n".join(discrepancies[:3]))
+                
+                # Auto-cleanup: Remove positions that don't exist
+                cleaned_positions = {k: v for k, v in saved_positions.items() 
+                                 if k in actual_positions}
+                save_positions(cleaned_positions)
+                return cleaned_positions
+            
+            return saved_positions
+        
+    except Exception as e:
+        print(f"Reconciliation failed: {e}")
+        return load_positions()
+
+
+def check_fee_impact(profit_cents, trade_type="arbitrage"):
+    """
+    Alert if fees are eating too much profit.
+    """
+    if trade_type == "arbitrage":
+        gross_profit = profit_cents + (profit_cents * TOTAL_FEE_PCT)
+        fee_impact_pct = (profit_cents * TOTAL_FEE_PCT) / gross_profit * 100
+        
+        if fee_impact_pct > 15:  # Fees > 15% of gross profit
+            print(f"   ⚠️ HIGH FEE IMPACT: {fee_impact_pct:.1f}% of gross profit")
+            tg(f"⚠️ *High fee impact*: {fee_impact_pct:.1f}% on arbitrage")
+    
+    return True
+
+
 def check_arbitrage(market, balance, positions):
     """
     FIXED ARBITRAGE: Use actual ASK prices, not mid-prices.
@@ -145,9 +239,9 @@ def check_arbitrage(market, balance, positions):
     if ticker in positions:
         return False, 0, 0, 0
     
-    # 🚨 CRITICAL FIX: Tighter threshold using actual costs
-    # Need significant margin after 7% fees
-    max_cost = 99.0  # Allow 1¢ margin for fees/slippage
+    # 🚨 CRITICAL FIX: Much better thresholds with 1.2% fees (not 7%!)
+    # Can be much more aggressive with low fees
+    max_cost = 99.5  # Allow 0.5¢ margin for 1.2% fees/slippage
     
     if total_cost < max_cost and ya > 0 and na > 0:
         # Calculate profit AFTER fees
@@ -231,7 +325,7 @@ def check_late_game(market, balance, positions):
 
 
 def execute_arbitrage(market, pairs, profit_cents, positions):
-    """Execute arbitrage with position tracking."""
+    """Execute arbitrage with position tracking and safety checks."""
     ticker = market["ticker"]
     ya = market.get("yes_ask", 0)
     na = market.get("no_ask", 0)
@@ -239,11 +333,14 @@ def execute_arbitrage(market, pairs, profit_cents, positions):
     ts = datetime.now().strftime("%H:%M:%S")
     total_net_profit = pairs * profit_cents / 100
     
+    # Safety check: fee impact
+    check_fee_impact(profit_cents, "arbitrage")
+    
     details = f"ARB: YES@{ya}c + NO@{na}c = {ya+na}c | {pairs} pairs | Net: +{profit_cents:.1f}¢/pair"
     
     print(f"\n[{ts}] 🎯 ARBITRAGE {ticker}")
     print(f"   {details}")
-    print(f"   💰 PROFIT: +${total_net_profit:.2f} (after fees)")
+    print(f"   💰 PROFIT: +${total_net_profit:.2f} (after {TOTAL_FEE_PCT*100:.0f}% fees)")
     
     if AUTO_TRADE:
         ok1, err1 = place_order(ticker, "yes", ya, pairs)
@@ -252,12 +349,24 @@ def execute_arbitrage(market, pairs, profit_cents, positions):
         if ok1 and ok2:
             print(f"   ✅ Arb executed! Hold to expiration.")
             tg(f"✅ *Arb filled* `{ticker}` — +${total_net_profit:.2f} net at expiry")
+            
+            # Update performance tracking
+            perf = load_performance()
+            perf["arb_trades"] += 1
+            perf["arb_profit"] += total_net_profit
+            save_performance(perf)
         else:
             print(f"   ❌ Arb failed: {err1} | {err2}")
             tg(f"❌ *Arb failed* `{ticker}`: {err1[:50]} | {err2[:50]}")
     else:
         print(f"   📝 PAPER TRADE: Would execute arbitrage")
         tg(f"📝 *Paper ARB* `{ticker}` | {pairs} pairs | +${total_net_profit:.2f} hypothetical")
+        
+        # Update performance tracking for paper trades
+        perf = load_performance()
+        perf["arb_trades"] += 1
+        perf["arb_profit"] += total_net_profit
+        save_performance(perf)
     
     # 🚨 CRITICAL FIX: Add to positions
     positions[ticker] = {
@@ -272,7 +381,7 @@ def execute_arbitrage(market, pairs, profit_cents, positions):
 
 
 def execute_late_game(market, side, confidence, balance, positions):
-    """Execute late-game trade with position tracking."""
+    """Execute late-game trade with position tracking and safety checks."""
     ticker = market["ticker"]
     price = market.get("yes_ask" if side == "yes" else "no_ask", 50)
     
@@ -288,6 +397,11 @@ def execute_late_game(market, side, confidence, balance, positions):
     
     ts = datetime.now().strftime("%H:%M:%S")
     
+    details = f"LATE: {side.upper()}@{price}c | {contracts} contracts | {confidence:.0%} conf | {mins_left:.1f}min"
+    
+    print(f"\n[{ts}] 🎯 LATE GAME {ticker}")
+    print(f"   {details}")
+    
     # Simulate outcome for paper trading
     if not AUTO_TRADE:
         import random
@@ -298,19 +412,22 @@ def execute_late_game(market, side, confidence, balance, positions):
             fees = gross_profit * TOTAL_FEE_PCT
             net_profit = gross_profit - fees
             result_text = f"SIMULATED WIN +${net_profit:.2f}"
+            pnl = net_profit
         else:
             cost = price * contracts / 100
             fees = cost * BUY_FEE_PCT
             net_loss = cost + fees
             result_text = f"SIMULATED LOSS -${net_loss:.2f}"
+            pnl = -net_loss
         
         print(f"   🎲 {result_text}")
         tg(f"📝 *Paper Late* `{ticker}` {side.upper()} | {result_text}")
-    
-    details = f"LATE: {side.upper()}@{price}c | {contracts} contracts | {confidence:.0%} conf | {mins_left:.1f}min"
-    
-    print(f"\n[{ts}] 🎯 LATE GAME {ticker}")
-    print(f"   {details}")
+        
+        # Update performance tracking for paper trades
+        perf = load_performance()
+        perf["late_trades"] += 1
+        perf["late_profit"] += pnl
+        save_performance(perf)
     
     if AUTO_TRADE:
         ok, err = place_order(ticker, side, price, contracts)
@@ -376,18 +493,37 @@ def check_exited_positions(positions):
 
 def run():
     print("=" * 60)
-    print("  GoobClaw ProfitBot v4 — CRITICAL BUGS FIXED")
+    print("  GoobClaw ProfitBot v4 — CORRECTED KALSHI FEES!")
     print(f"  Auto: {AUTO_TRADE} | Kelly: {KELLY_FRACTION} | Min Arb: {MIN_ARB_PROFIT}¢")
     print(f"  🔧 Fixed: Arbitrage cost calc, position tracking, realistic thresholds")
+    print(f"  ✅ CORRECTED: Kalshi fees are ~1.2% (NOT 7%!)")
     print("=" * 60)
-    tg("🦞 *ProfitBot v4 online* — Critical bugs fixed")
+    tg("🦞 *ProfitBot v4 online* — CORRECTED FEES!")
     
     trades_today = 0
     arb_count = 0
     late_count = 0
     
-    # Load existing positions
-    positions = load_positions()
+    # Load existing positions and reconcile with API
+    positions = reconcile_positions()
+    
+    # Load performance stats
+    perf = load_performance()
+    
+    # Show startup stats
+    if perf["arb_trades"] > 0 or perf["late_trades"] > 0:
+        total_trades = perf["arb_trades"] + perf["late_trades"]
+        total_profit = perf["arb_profit"] + perf["late_profit"]
+        avg_profit = total_profit / total_trades if total_trades > 0 else 0
+        
+        print(f"\n📊 HISTORICAL PERFORMANCE:")
+        print(f"   Total Trades: {total_trades}")
+        print(f"   Arbitrage: {perf['arb_trades']} trades | +${perf['arb_profit']:.2f}")
+        print(f"   Late Game: {perf['late_trades']} trades | ${perf['late_profit']:.2f}")
+        print(f"   Total P&L: ${total_profit:.2f}")
+        print(f"   Avg Profit: ${avg_profit:.2f}/trade")
+    
+    reconciliation_counter = 0
     
     while True:
         try:
@@ -396,6 +532,12 @@ def run():
             
             if balance:
                 print(f"\n[{ts}] Bankroll: ${balance:.2f}")
+            
+            # Reconcile positions every 10 cycles (5 minutes)
+            reconciliation_counter += 1
+            if reconciliation_counter >= 10:
+                positions = reconcile_positions()
+                reconciliation_counter = 0
             
             # Check for expired positions
             positions = check_exited_positions(positions)
@@ -438,11 +580,29 @@ def run():
             
             print(f"[{ts}] Done. Today's: {trades_today} trades (arb: {arb_count}, late: {late_count})")
             
+            # Show updated performance every hour
+            if int(time.time()) % 3600 < 45:
+                perf = load_performance()
+                total_trades = perf["arb_trades"] + perf["late_trades"]
+                total_profit = perf["arb_profit"] + perf["late_profit"]
+                if total_trades > 0:
+                    print(f"\n📊 UPDATED PERFORMANCE:")
+                    print(f"   Total P&L: ${total_profit:.2f} | Avg: ${total_profit/total_trades:.2f}/trade")
+            
             # Slow scan — we're patient hunters
             time.sleep(30)
             
         except KeyboardInterrupt:
             print("\nStopped.")
+            # Show final performance
+            perf = load_performance()
+            total_trades = perf["arb_trades"] + perf["late_trades"]
+            total_profit = perf["arb_profit"] + perf["late_profit"]
+            print(f"\n📊 FINAL PERFORMANCE:")
+            print(f"   Total Trades: {total_trades}")
+            print(f"   Total P&L: ${total_profit:.2f}")
+            if total_trades > 0:
+                print(f"   Average Profit: ${total_profit/total_trades:.2f}/trade")
             break
         except Exception as e:
             print(f"Error: {e}")
