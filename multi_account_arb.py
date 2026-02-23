@@ -125,10 +125,12 @@ def run():
     else:
         print(f"   ❌ Account 1: Connection failed")
     
-    if bal2:
+    if bal2 is not None:
         print(f"   ✅ Account 2: ${bal2:.2f}")
+        if bal2 == 0:
+            print(f"   ⚠️  Account 2 has $0 balance - add funds to trade")
     else:
-        print(f"   ⚠️  Account 2: Not configured (set KALSHI_EMAIL and KALSHI_PASSWORD in .env)")
+        print(f"   ⚠️  Account 2: Not configured (set KALSHI_API_KEY_ID_2 and KALSHI_PRIVATE_KEY_PATH_2)")
     
     if not bal1:
         print("\n❌ Account 1 failed — cannot continue")
