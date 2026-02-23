@@ -8,12 +8,21 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 load_dotenv()
 
-def get_kalshi_headers(method: str, path: str) -> dict:
-    """Build Kalshi auth headers. Raises on missing env or key errors."""
-    api_key = os.getenv("KALSHI_API_KEY_ID")
-    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+def get_kalshi_headers(method: str, path: str, account: int = 1) -> dict:
+    """Build Kalshi auth headers. Uses account 1 or 2.
+    
+    Account 1: Uses KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH
+    Account 2: Uses KALSHI_API_KEY_ID_2 + KALSHI_PRIVATE_KEY_PATH_2
+    """
+    if account == 2:
+        api_key = os.getenv("KALSHI_API_KEY_ID_2")
+        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH_2")
+    else:
+        api_key = os.getenv("KALSHI_API_KEY_ID")
+        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+    
     if not api_key or not key_path:
-        raise RuntimeError("Missing KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH in environment")
+        raise RuntimeError(f"Missing credentials for account {account}")
 
     with open(key_path, "rb") as f:
         p_key = serialization.load_pem_private_key(f.read(), password=None)
@@ -33,6 +42,68 @@ def get_kalshi_headers(method: str, path: str) -> dict:
         "KALSHI-ACCESS-SIGNATURE": sig,
         "KALSHI-ACCESS-TIMESTAMP": ts,
     }
+
+
+def place_order(ticker: str, side: str, price_cents: int, count: int = 1, 
+                action: str = "buy", account: int = 1):
+    """Place an order on account 1 or 2.
+    
+    Returns (success: bool, response)
+    """
+    import uuid
+    path = "/trade-api/v2/portfolio/orders"
+    payload = {
+        "action": action,
+        "count": count,
+        "side": side,
+        "ticker": ticker,
+        "type": "limit",
+        "yes_price": price_cents if side == "yes" else 100 - price_cents,
+        "client_order_id": str(uuid.uuid4())
+    }
+    headers = get_kalshi_headers("POST", path, account)
+    headers["Content-Type"] = "application/json"
+    
+    base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+    
+    try:
+        res = requests.post(base_url + path, json=payload, headers=headers, timeout=10)
+        return res.status_code == 201, res.text
+    except Exception as e:
+        return False, str(e)
+
+
+def get_balance(account: int = 1) -> float:
+    """Get balance for account 1 or 2."""
+    path = "/trade-api/v2/portfolio/balance"
+    base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+    
+    try:
+        headers = get_kalshi_headers("GET", path, account)
+        res = requests.get(base_url + path, headers=headers, timeout=10)
+        if res.status_code == 200:
+            return res.json().get("balance", 0) / 100
+    except:
+        pass
+    return None
+
+
+def test_connection(timeout: int = 5, account: int = 1) -> dict:
+    """Test the Kalshi balance endpoint for account 1 or 2."""
+    b_path = "/trade-api/v2/portfolio/balance"
+    base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+    url = base_url + b_path
+
+    try:
+        headers = get_kalshi_headers("GET", b_path, account)
+    except Exception as e:
+        return {"error": str(e)}
+
+    try:
+        res = requests.get(url, headers=headers, timeout=timeout)
+        return {"status_code": res.status_code, "text": res.text}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def test_connection(timeout: int = 5) -> dict:

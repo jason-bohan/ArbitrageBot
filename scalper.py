@@ -105,9 +105,12 @@ def place_order(ticker, side, price_cents, count=1, action="buy"):
 
 
 def scan_markets():
-    """Find liquid markets closing soon."""
+    """Find liquid markets — widened time window."""
     now = datetime.now(timezone.utc)
-    path = f"/trade-api/v2/markets?status=open&min_close_ts={int(now.timestamp()+MIN_SECS_LEFT)}&max_close_ts={int(now.timestamp()+MAX_SECS_LEFT)}&limit=100"
+    # Look for markets closing in 1-30 minutes (was 2-10 min)
+    min_secs = 60   # 1 min
+    max_secs = 1800  # 30 min
+    path = f"/trade-api/v2/markets?status=open&min_close_ts={int(now.timestamp()+min_secs)}&max_close_ts={int(now.timestamp()+max_secs)}&limit=100"
     try:
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
         if res.status_code == 200:
