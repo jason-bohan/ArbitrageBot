@@ -8,22 +8,11 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 load_dotenv()
 
-def get_kalshi_headers(method: str, path: str, account: int = 1) -> dict:
-    """Build Kalshi auth headers. Uses account 1 or 2.
-    
-    Account 1: Uses KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH
-    Account 2: Uses KALSHI_API_KEY_ID_2 + KALSHI_PRIVATE_KEY_PATH_2
-    """
-    if account == 2:
-        api_key = os.getenv("KALSHI_API_KEY_ID_2")
-        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH_2")
-    else:
-        api_key = os.getenv("KALSHI_API_KEY_ID")
-        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
-    
-    if not api_key or not key_path:
-        raise RuntimeError(f"Missing credentials for account {account}")
+BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
 
+
+def get_kalshi_headers_api(method: str, path: str, api_key: str, key_path: str) -> dict:
+    """Build Kalshi auth headers using API key."""
     with open(key_path, "rb") as f:
         p_key = serialization.load_pem_private_key(f.read(), password=None)
 
@@ -42,6 +31,49 @@ def get_kalshi_headers(method: str, path: str, account: int = 1) -> dict:
         "KALSHI-ACCESS-SIGNATURE": sig,
         "KALSHI-ACCESS-TIMESTAMP": ts,
     }
+
+
+def get_kalshi_headers(method: str, path: str, account: int = 1) -> dict:
+    """Build Kalshi auth headers. Uses API key for account 1, email/password for account 2."""
+    
+    if account == 2:
+        # Account 2: Use email/password
+        email = os.getenv("KALSHI_EMAIL")
+        password = os.getenv("KALSHI_PASSWORD")
+        
+        if not email or not password:
+            raise RuntimeError("Missing KALSHI_EMAIL or KALSHI_PASSWORD for account 2")
+        
+        # Login to get session token
+        login_path = "/user-api/v1/auth/login"
+        login_url = BASE_URL + login_path
+        
+        try:
+            login_res = requests.post(login_url, json={
+                "email": email,
+                "password": password
+            }, timeout=10)
+            
+            if login_res.status_code == 200:
+                token = login_res.json().get("token")
+                return {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                }
+            else:
+                raise RuntimeError(f"Login failed: {login_res.status_code}")
+        except Exception as e:
+            raise RuntimeError(f"Account 2 login error: {e}")
+    
+    else:
+        # Account 1: Use API key
+        api_key = os.getenv("KALSHI_API_KEY_ID")
+        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+        
+        if not api_key or not key_path:
+            raise RuntimeError("Missing KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH")
+        
+        return get_kalshi_headers_api(method, path, api_key, key_path)
 
 
 def place_order(ticker: str, side: str, price_cents: int, count: int = 1, 
