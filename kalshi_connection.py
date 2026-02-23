@@ -37,14 +37,33 @@ def get_kalshi_headers(method: str, path: str, account: int = 1) -> dict:
     """Build Kalshi auth headers. Supports multiple accounts."""
     
     if account == 2:
-        # Account 2: Use API key
-        api_key = os.getenv("KALSHI_API_KEY_ID_2")
-        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH_2")
+        # Account 2: Use email/password
+        email = os.getenv("KALSHI_EMAIL_2")
+        password = os.getenv("KALSHI_PASSWORD_2")
         
-        if not api_key or not key_path:
-            raise RuntimeError("Missing KALSHI_API_KEY_ID_2 or KALSHI_PRIVATE_KEY_PATH_2 for account 2")
+        if not email or not password:
+            raise RuntimeError("Missing KALSHI_EMAIL_2 or KALSHI_PASSWORD_2 for account 2")
         
-        return get_kalshi_headers_api(method, path, api_key, key_path)
+        # Login to get session token
+        login_path = "/user-api/v1/auth/login"
+        login_url = BASE_URL + login_path
+        
+        try:
+            login_res = requests.post(login_url, json={
+                "email": email,
+                "password": password
+            }, timeout=10)
+            
+            if login_res.status_code == 200:
+                token = login_res.json().get("token")
+                return {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                }
+            else:
+                raise RuntimeError(f"Account 2 login failed: {login_res.status_code}")
+        except Exception as e:
+            raise RuntimeError(f"Account 2 login error: {e}")
     
     else:
         # Account 1: Use API key

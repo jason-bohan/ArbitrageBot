@@ -128,7 +128,7 @@ def run():
     if bal2:
         print(f"   ✅ Account 2: ${bal2:.2f}")
     else:
-        print(f"   ⚠️  Account 2: Not configured (set KALSHI_API_KEY_ID_2 and KALSHI_PRIVATE_KEY_PATH_2)")
+        print(f"   ⚠️  Account 2: Not configured (set KALSHI_EMAIL and KALSHI_PASSWORD in .env)")
     
     if not bal1:
         print("\n❌ Account 1 failed — cannot continue")
