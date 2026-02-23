@@ -34,36 +34,17 @@ def get_kalshi_headers_api(method: str, path: str, api_key: str, key_path: str) 
 
 
 def get_kalshi_headers(method: str, path: str, account: int = 1) -> dict:
-    """Build Kalshi auth headers. Uses API key for account 1, email/password for account 2."""
+    """Build Kalshi auth headers. Supports multiple accounts."""
     
     if account == 2:
-        # Account 2: Use email/password
-        email = os.getenv("KALSHI_EMAIL")
-        password = os.getenv("KALSHI_PASSWORD")
+        # Account 2: Use API key
+        api_key = os.getenv("KALSHI_API_KEY_ID_2")
+        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH_2")
         
-        if not email or not password:
-            raise RuntimeError("Missing KALSHI_EMAIL or KALSHI_PASSWORD for account 2")
+        if not api_key or not key_path:
+            raise RuntimeError("Missing KALSHI_API_KEY_ID_2 or KALSHI_PRIVATE_KEY_PATH_2 for account 2")
         
-        # Login to get session token
-        login_path = "/user-api/v1/auth/login"
-        login_url = BASE_URL + login_path
-        
-        try:
-            login_res = requests.post(login_url, json={
-                "email": email,
-                "password": password
-            }, timeout=10)
-            
-            if login_res.status_code == 200:
-                token = login_res.json().get("token")
-                return {
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json"
-                }
-            else:
-                raise RuntimeError(f"Login failed: {login_res.status_code}")
-        except Exception as e:
-            raise RuntimeError(f"Account 2 login error: {e}")
+        return get_kalshi_headers_api(method, path, api_key, key_path)
     
     else:
         # Account 1: Use API key
@@ -118,6 +99,25 @@ def get_balance(account: int = 1) -> float:
     except:
         pass
     return None
+
+
+def get_balance(account: int = 1) -> float:
+    """Get balance for specific account."""
+    path = "/trade-api/v2/portfolio/balance"
+    base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+    
+    try:
+        headers = get_kalshi_headers("GET", path, account)
+        res = requests.get(base_url + path, headers=headers, timeout=10)
+        
+        if res.status_code == 200:
+            balance = res.json().get("balance", 0)
+            return balance / 100  # Convert cents to dollars
+        else:
+            return None
+    except Exception as e:
+        print(f"Balance error (account {account}): {e}")
+        return None
 
 
 def test_connection(timeout: int = 5, account: int = 1) -> dict:
