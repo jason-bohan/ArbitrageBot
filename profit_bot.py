@@ -129,7 +129,7 @@ def place_order(ticker, side, price_cents, count, action="buy"):
 def load_positions():
     """Load existing positions."""
     try:
-        with open(POSITIONS_FILE, "r") as f:
+        with open(POSITIONS_FILE, "r", encoding='utf-8', errors='replace') as f:
             return json.load(f)
     except:
         return {}
@@ -137,14 +137,14 @@ def load_positions():
 
 def save_positions(positions):
     """Save positions to file."""
-    with open(POSITIONS_FILE, "w") as f:
-        json.dump(positions, f, indent=2)
+    with open(POSITIONS_FILE, "w", encoding='utf-8', errors='replace') as f:
+        json.dump(positions, f, indent=2, ensure_ascii=False)
 
 
 def load_performance():
     """Load performance tracking data."""
     try:
-        with open(PERFORMANCE_LOG, "r") as f:
+        with open(PERFORMANCE_LOG, "r", encoding='utf-8', errors='replace') as f:
             return json.load(f)
     except:
         return {"arb_trades": 0, "late_trades": 0, "arb_profit": 0, "late_profit": 0}
@@ -152,8 +152,8 @@ def load_performance():
 
 def save_performance(perf):
     """Save performance tracking data."""
-    with open(PERFORMANCE_LOG, "w") as f:
-        json.dump(perf, f, indent=2)
+    with open(PERFORMANCE_LOG, "w", encoding='utf-8', errors='replace') as f:
+        json.dump(perf, f, indent=2, ensure_ascii=False)
 
 
 def reconcile_positions():
