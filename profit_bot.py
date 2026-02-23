@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 GoobClaw ProfitBot — Mathematical Edge Only (CRITICAL BUGS FIXED)
-Strategy:
-1. Pairs arbitrage (YES + NO < $1) — risk-free profit
-2. Late-game mispricing (>75% or <25% with time left)
-3. Strict position sizing (Kelly Criterion lite)
-4. No "hope" trades — only edges with >60% win prob
-
-CRITICAL FIXES v4:
-- Fixed arbitrage cost calculation (uses ASK prices, not mid-prices)
-- Added position tracking (prevents double-entering same market)
-- More realistic late-game thresholds (25¢/75¢ vs 20¢/80¢)
-- Added expiration handling and position management
 """
 
 import os
+import sys
+import unicodedata
+
+# Fix Unicode printing issues
+if sys.version_info[0] >= 3:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import time
+
+
+def safe_print(*args, **kwargs):
+    """Print that handles Unicode characters safely."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        # Fallback: encode with replace
+        args = [str(a).encode('utf-8', errors='replace').decode('utf-8', errors='replace') for a in args]
+        print(*args, **kwargs)
 import uuid
 import requests
 import math
@@ -461,7 +469,13 @@ def check_exited_positions(positions):
             continue
         
         try:
-            close = datetime.fromisoformat(market["close_time"].replace("Z", "+00:00"))
+            # Handle missing close_time
+            close_time_str = market.get("close_time")
+            if not close_time_str:
+                current_positions[ticker] = pos
+                continue
+                
+            close = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
             secs_left = (close - datetime.now(timezone.utc)).total_seconds()
             
             if secs_left <= 0:  # Expired
