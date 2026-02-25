@@ -69,9 +69,9 @@ def get_balance():
 def get_pnl_summary():
     """Fetch realized P&L from settlements."""
     # Settlements — completed/resolved trades
-    path = "/trade-api/v2/portfolio/settlements"
+    sig_path = "/trade-api/v2/portfolio/settlements"
     try:
-        res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        res = requests.get(BASE_URL + sig_path, headers=get_kalshi_headers("GET", sig_path), timeout=10)
         settlements = res.json().get("settlements", []) if res.status_code == 200 else []
     except:
         settlements = []
@@ -103,17 +103,17 @@ def get_pnl_summary():
 
 def get_trade_outcomes(limit=20):
     """Show individual trade outcomes by cross-referencing fills with settlements."""
-    path_fills = f"/trade-api/v2/portfolio/fills?limit={limit}"
-    path_sett = "/trade-api/v2/portfolio/settlements?limit=100"
+    sig_path_fills = "/trade-api/v2/portfolio/fills"
+    sig_path_sett = "/trade-api/v2/portfolio/settlements"
     
     try:
-        fills_res = requests.get(BASE_URL + path_fills, headers=get_kalshi_headers("GET", path_fills), timeout=10)
+        fills_res = requests.get(BASE_URL + sig_path_fills + f"?limit={limit}", headers=get_kalshi_headers("GET", sig_path_fills), timeout=10)
         fills = fills_res.json().get("fills", []) if fills_res.status_code == 200 else []
     except:
         fills = []
     
     try:
-        sett_res = requests.get(BASE_URL + path_sett, headers=get_kalshi_headers("GET", path_sett), timeout=10)
+        sett_res = requests.get(BASE_URL + sig_path_sett + "?limit=100", headers=get_kalshi_headers("GET", sig_path_sett), timeout=10)
         settlements = sett_res.json().get("settlements", []) if sett_res.status_code == 200 else []
     except:
         settlements = []

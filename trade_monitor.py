@@ -29,11 +29,16 @@ def get_balance():
 
 def get_fills(days=1):
     """Get fills from the last N days."""
-    path = f"/trade-api/v2/portfolio/fills?limit=500"
+    sig_path = "/trade-api/v2/portfolio/fills"
+    full_path = sig_path + "?limit=500"
     try:
-        res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        res = requests.get(
+            BASE_URL + full_path,
+            headers=get_kalshi_headers("GET", sig_path),  # ← clean path, no query
+            timeout=10
+        )
         if res.status_code != 200:
-            print(f"  ⚠️ Fills API returned {res.status_code}: {res.text[:200]}")
+            print(f"  ⚠️ Fills API returned {res.status_code}")
             return []
         fills = res.json().get("fills", [])
         
@@ -55,25 +60,32 @@ def get_fills(days=1):
 
 def get_settlements(days=1):
     """Get settlements from the last N days."""
-    path = "/trade-api/v2/portfolio/settlements?limit=500"
+    sig_path = "/trade-api/v2/portfolio/settlements"
+    full_path = sig_path + "?limit=500"
     try:
-        res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
-        if res.status_code == 200:
-            settlements = res.json().get("settlements", [])
-            
-            # Filter by date
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            filtered = []
-            for s in settlements:
-                try:
-                    created = datetime.fromisoformat(s.get("created_at", "").replace("Z", "+00:00"))
-                    if created >= cutoff:
-                        filtered.append(s)
-                except:
-                    pass
-            return filtered
+        res = requests.get(
+            BASE_URL + full_path,
+            headers=get_kalshi_headers("GET", sig_path),  # ← clean path, no query
+            timeout=10
+        )
+        if res.status_code != 200:
+            print(f"  ⚠️ Settlements API returned {res.status_code}")
+            return []
+        settlements = res.json().get("settlements", [])
+        
+        # Filter by date
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        filtered = []
+        for s in settlements:
+            try:
+                created = datetime.fromisoformat(s.get("created_at", "").replace("Z", "+00:00"))
+                if created >= cutoff:
+                    filtered.append(s)
+            except:
+                pass
+        return filtered
     except Exception as e:
-        print(f"  ⚠️ Error: {e}")
+        print(f"  ⚠️ Error getting settlements: {e}")
     return []
 
 
