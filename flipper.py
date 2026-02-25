@@ -66,6 +66,97 @@ def get_balance():
     return None
 
 
+def get_pnl_summary():
+    """Fetch realized P&L from settlements."""
+    # Settlements — completed/resolved trades
+    path = "/trade-api/v2/portfolio/settlements"
+    try:
+        res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        settlements = res.json().get("settlements", []) if res.status_code == 200 else []
+    except:
+        settlements = []
+    
+    total_revenue = sum(s.get("revenue", 0) for s in settlements)
+    total_cost = sum(s.get("yes_total_cost", 0) + s.get("no_total_cost", 0) for s in settlements)
+    total_fees = sum(float(s.get("fee_cost", 0)) for s in settlements)
+    realized_pnl = (total_revenue - total_cost) / 100
+    
+    wins = sum(1 for s in settlements if s.get("revenue", 0) > (s.get("yes_total_cost", 0) + s.get("no_total_cost", 0)))
+    losses = len(settlements) - wins
+    win_rate = (wins / len(settlements) * 100) if settlements else 0
+    
+    balance = get_balance()
+    
+    print("\n" + "=" * 50)
+    print(" 📊 P&L SUMMARY")
+    print("=" * 50)
+    print(f" Balance: ${balance:.2f}" if balance else " Balance: N/A")
+    print(f" Settled trades: {len(settlements)}")
+    print(f" Wins/Losses: {wins}W / {losses}L ({win_rate:.1f}% win rate)")
+    print(f" Realized P&L: ${realized_pnl:.2f}")
+    print(f" Fees paid: ${total_fees:.2f}")
+    print(f" Net after fees: ${realized_pnl - total_fees:.2f}")
+    print("=" * 50 + "\n")
+    
+    return realized_pnl, win_rate
+
+
+def get_trade_outcomes(limit=20):
+    """Show individual trade outcomes by cross-referencing fills with settlements."""
+    path_fills = f"/trade-api/v2/portfolio/fills?limit={limit}"
+    path_sett = "/trade-api/v2/portfolio/settlements?limit=100"
+    
+    try:
+        fills_res = requests.get(BASE_URL + path_fills, headers=get_kalshi_headers("GET", path_fills), timeout=10)
+        fills = fills_res.json().get("fills", []) if fills_res.status_code == 200 else []
+    except:
+        fills = []
+    
+    try:
+        sett_res = requests.get(BASE_URL + path_sett, headers=get_kalshi_headers("GET", path_sett), timeout=10)
+        settlements = sett_res.json().get("settlements", []) if sett_res.status_code == 200 else []
+    except:
+        settlements = []
+    
+    # Build lookup of settled tickers → revenue
+    settled = {s["ticker"]: s.get("revenue", 0) for s in settlements}
+    
+    print("\n" + "=" * 60)
+    print(f" 📋 RECENT TRADES (last {limit})")
+    print("=" * 60)
+    
+    wins = 0
+    losses = 0
+    
+    for f in fills:
+        ticker = f.get("ticker", "?")
+        price = f.get("yes_price", 0)
+        action = f.get("action", "?")
+        count = f.get("count", 0)
+        
+        if ticker in settled:
+            payout = settled[ticker]
+            cost = price * count
+            pnl = payout - cost
+            if pnl >= 0:
+                outcome = f"✅ +{pnl/100:.2f}"
+                wins += 1
+            else:
+                outcome = f"❌ {pnl/100:.2f}"
+                losses += 1
+        else:
+            outcome = "⏳ open"
+        
+        print(f" {ticker:<28} {action} @{price}c x{count} {outcome}")
+    
+    print("-" * 60)
+    if wins + losses > 0:
+        print(f" Record: {wins}W / {losses}L ({(wins/(wins+losses))*100:.0f}% win rate)")
+    else:
+        print(" No settled trades yet")
+    print("=" * 60 + "\n")
+
+
 def get_contracts(balance, entry_price):
     """Auto-scale contracts based on bankroll. Returns 1 if FIXED_CONTRACTS > 0."""
     if FIXED_CONTRACTS > 0:
@@ -321,7 +412,12 @@ def run():
     print("=" * 60)
     tg("🦞 *Flipper v3 online* — swing trading")
 
+    # Show P&L summary at startup
+    get_pnl_summary()
+    get_trade_outcomes()
+
     traded = set()
+    cycle = 0
 
     while True:
         try:
@@ -347,6 +443,12 @@ def run():
 
             print(f"[{ts}] 📡 Scanning {len(list(all_markets))} markets (priority: {len(priority_markets)}, sweep: {len(sweep)})...")
             all_markets = {m["ticker"]: m for m in priority_markets + sweep}.values()
+            
+            cycle += 1
+            if cycle % 10 == 0:
+                print(f"\n[{ts}] 🔄 Cycle {cycle} — P&L check:")
+                get_pnl_summary()
+                get_trade_outcomes()
 
             for m in all_markets:
                 ticker = m["ticker"]
