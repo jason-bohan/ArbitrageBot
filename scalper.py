@@ -20,12 +20,14 @@ BASE_URL = "https://api.elections.kalshi.com"
 # === SCALPER PARAMETERS ===
 MIN_SPREAD_TO_TRADE = 0   # Accept any spread
 MAX_SPREAD_TO_TRADE = 3   # Skip if spread > 3¢
-TAKE_PROFIT_CENTS = 2     # Tight 2¢ target
-STOP_LOSS_CENTS = 2       # Tight 2¢ stop
+TAKE_PROFIT_CENTS = 5     # 5c target (room for fees)
+STOP_LOSS_CENTS = 3       # 3c stop (survivable volatility)
 MAX_SECS_LEFT = 600       # Enter with ≤10 min left
 MIN_SECS_LEFT = 120       # Exit if <2 min
 CONTRACTS = 1
 AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
+SCALP_ENTRY_MIN = 40      # Enter YES between 40-60c
+SCALP_ENTRY_MAX = 60      # Enter NO between 40-60c
 
 
 def tg(msg):
@@ -53,8 +55,10 @@ def get_orderbook(ticker):
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=5)
         if res.status_code == 200:
             return res.json().get("orderbook", {})
-    except:
-        pass
+        else:
+            print(f"  🌐 GET {ticker} orderbook → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
+    except Exception as e:
+        print(f"  🌐 GET {ticker} orderbook → ⚠️ {e}")
     return {}
 
 
@@ -64,8 +68,10 @@ def get_market(ticker):
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=5)
         if res.status_code == 200:
             return res.json().get("market", {})
-    except:
-        pass
+        else:
+            print(f"  🌐 GET {ticker} → {res.status_code}")
+    except Exception as e:
+        print(f"  🌐 GET {ticker} → ⚠️ {e}")
     return {}
 
 
@@ -99,8 +105,10 @@ def place_order(ticker, side, price_cents, count=1, action="buy"):
     headers["Content-Type"] = "application/json"
     try:
         res = requests.post(BASE_URL + path, json=payload, headers=headers, timeout=5)
+        print(f"  🌐 POST {ticker} {side}@{price_cents}c → {res.status_code} {'✅' if res.status_code == 201 else '❌'}")
         return res.status_code == 201, res.text
     except Exception as e:
+        print(f"  🌐 POST order → ⚠️ {e}")
         return False, str(e)
 
 
@@ -113,19 +121,21 @@ def scan_markets():
     path = f"/trade-api/v2/markets?status=open&min_close_ts={int(now.timestamp()+min_secs)}&max_close_ts={int(now.timestamp()+max_secs)}&limit=100"
     try:
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        print(f"  🌐 GET markets scan → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
         if res.status_code == 200:
             return res.json().get("markets", [])
-    except:
-        pass
+    except Exception as e:
+        print(f"  🌐 GET markets scan → ⚠️ {e}")
     return []
 
 
 def should_enter(market, orderbook):
     """
     Scalper entry rules:
-    1. Spread must be tight (<3¢)
-    2. Price must be near 50 (liquid)
-    3. Both sides must have depth
+    1. Spread must be tight (<3¢ each side)
+    2. Total cost must be near 100¢ (for arbitrage-like trades)
+    3. Price must be near 50 (liquid)
+    4. Both sides must have depth
     """
     ya = market.get("yes_ask", 0)
     yb = market.get("yes_bid", 0)
@@ -136,6 +146,11 @@ def should_enter(market, orderbook):
     yes_spread = ya - yb if ya and yb else 999
     no_spread = na - nb if na and nb else 999
     
+    # Check TOTAL spread (YES + NO should be close to 100)
+    total_cost = ya + na if ya and na else 999
+    if total_cost > 103:  # Allow 3¢ buffer for fees/slippage
+        return None, f"total_spread_too_wide({total_cost}c)"
+    
     # Skip illiquid
     if yes_spread > MAX_SPREAD_TO_TRADE or no_spread > MAX_SPREAD_TO_TRADE:
         return None, "wide_spread"
@@ -144,10 +159,15 @@ def should_enter(market, orderbook):
     if ya >= 90 or na >= 90:
         return None, "decided"
     
+    # Skip if one side is too extreme (not a true 50/50 market)
+    # Both YES and NO should be within 40-60c for proper scalping
+    if ya < 40 or ya > 60 or na < 40 or na > 60:
+        return None, "extreme_prices"
+    
     # Pick side with tighter spread and better price
-    if yes_spread <= no_spread and ya <= 60:
+    if yes_spread <= no_spread:
         return "yes", f"yes_spread={yes_spread}c"
-    elif no_spread < yes_spread and na <= 60:
+    else:
         return "no", f"no_spread={no_spread}c"
     
     return None, "no_edge"
@@ -191,11 +211,28 @@ def scalp_market(market):
         if sl is not None and sl < MIN_SECS_LEFT:
             print(f"  ⚠️ Near expiry, exiting")
             if AUTO_TRADE:
-                place_order(ticker, side, m.get("yes_bid" if side == "yes" else "no_bid"), CONTRACTS, action="sell")
+                current_bid = m.get("yes_bid" if side == "yes" else "no_bid", 0)
+                if current_bid > 0:
+                    place_order(ticker, side, current_bid, CONTRACTS, action="sell")
             break
         
-        # Get current bid (what you can sell at)
+        # Get current bid from market data (more reliable)
         current_bid = m.get("yes_bid" if side == "yes" else "no_bid", 0)
+        
+        # Fallback to orderbook if market bid is weird
+        if current_bid <= 0 or current_bid > 99:
+            ob = get_orderbook(ticker)
+            if side == "yes":
+                yes_data = ob.get("yes", [])
+                current_bid = yes_data[0][0] if yes_data and yes_data[0][0] > 0 else 0
+            else:
+                no_data = ob.get("no", [])
+                current_bid = no_data[0][0] if no_data and no_data[0][0] > 0 else 0
+        
+        # Skip if no valid bid
+        if current_bid <= 0:
+            continue
+        
         pnl = current_bid - entry
         
         ts = datetime.now().strftime("%H:%M:%S")
@@ -236,7 +273,7 @@ def run():
         try:
             ts = datetime.now().strftime("%H:%M:%S")
             markets = scan_markets()
-            print(f"[{ts}] Scanning {len(markets)} markets...")
+            print(f"[{ts}] 📡 Scanning {len(markets)} markets...")
             
             for m in markets:
                 ticker = m["ticker"]

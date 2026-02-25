@@ -39,9 +39,9 @@ AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
 
 # === FIXED PROFIT PARAMETERS ===
 KELLY_FRACTION = 0.25        # Kelly Lite (don't overbet)
-MIN_ARB_PROFIT = 0.50        # $0.50 minimum for arbitrage (after fees)
-MIN_LATE_GAP = 10             # 10¢ gap minimum for late-game (more realistic)
-MAX_TIME_LEFT = 240          # Enter only with <4 min left
+MIN_ARB_PROFIT = 0.10        # $0.10 minimum for arbitrage (after fees)
+MIN_LATE_GAP = 3             # 3¢ gap minimum for late-game
+MAX_TIME_LEFT = 600          # Enter only with <10 min left
 MIN_VOLUME = 5000           # Skip illiquid markets
 BANKROLL_PCT = 0.02          # Max 2% of bankroll per trade
 
@@ -75,10 +75,11 @@ def get_balance():
     try:
         path = "/trade-api/v2/portfolio/balance"
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=5)
+        print(f"  🌐 GET balance → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
         if res.status_code == 200:
             return res.json().get("balance", 0) / 100
-    except:
-        pass
+    except Exception as e:
+        print(f"  🌐 GET balance → ⚠️ {e}")
     return None
 
 
@@ -88,8 +89,10 @@ def get_market(ticker):
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=5)
         if res.status_code == 200:
             return res.json().get("market", {})
-    except:
-        pass
+        else:
+            print(f"  🌐 GET {ticker} → {res.status_code}")
+    except Exception as e:
+        print(f"  🌐 GET {ticker} → ⚠️ {e}")
     return None
 
 
@@ -99,11 +102,34 @@ def get_open_markets():
     path = f"/trade-api/v2/markets?status=open&limit=200"
     try:
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=15)
+        print(f"  🌐 GET open markets → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
         if res.status_code == 200:
             return res.json().get("markets", [])
-    except:
-        pass
+    except Exception as e:
+        print(f"  🌐 GET open markets → ⚠️ {e}")
     return []
+
+
+def get_trade_history_today():
+    """Get order history from today via API.
+    Note: May return 401 if API key lacks orders permission.
+    """
+    try:
+        path = "/trade-api/v2/portfolio/orders?status=filled&limit=100"
+        res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        if res.status_code == 200:
+            orders = res.json().get("orders", [])
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            today_orders = [o for o in orders if o.get("created_at", "").startswith(today)]
+            return len(today_orders)
+        elif res.status_code == 401:
+            # Permission denied - API key doesn't have orders access
+            return None
+        else:
+            print(f"  🌐 GET order history → {res.status_code}")
+    except Exception as e:
+        print(f"  🌐 GET order history → ⚠️ {e}")
+    return None
 
 
 def place_order(ticker, side, price_cents, count, action="buy"):
@@ -121,8 +147,10 @@ def place_order(ticker, side, price_cents, count, action="buy"):
     headers["Content-Type"] = "application/json"
     try:
         res = requests.post(BASE_URL + path, json=payload, headers=headers, timeout=5)
+        print(f"  🌐 POST {ticker} {side}@{price_cents}c → {res.status_code} {'✅' if res.status_code == 201 else '❌'}")
         return res.status_code == 201, res.text
     except Exception as e:
+        print(f"  🌐 POST order → ⚠️ {e}")
         return False, str(e)
 
 
@@ -165,6 +193,7 @@ def reconcile_positions():
         # Get actual portfolio from API
         path = "/trade-api/v2/portfolio/positions"
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        print(f"  🌐 GET portfolio positions → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
         
         if res.status_code == 200:
             actual_positions = {}
@@ -557,7 +586,7 @@ def run():
             positions = check_exited_positions(positions)
             
             markets = get_open_markets()
-            print(f"Scanning {len(markets)} markets... | Active positions: {len(positions)}")
+            print(f"[{ts}] 📡 Scanning {len(markets)} markets... | Active positions: {len(positions)}")
             
             arb_taken = 0
             late_taken = 0
@@ -573,6 +602,11 @@ def run():
                 if ya == 0 or na == 0:
                     continue
                 
+                # Debug: show market prices
+                total_cost = ya + na
+                if int(time.time()) % 120 < 30:  # Debug every ~2 min
+                    print(f"   🔍 {ticker}: YES@{ya}c NO@{na}c total={total_cost}c")
+                
                 # Check arbitrage first (risk-free money)
                 if balance and ya > 0 and na > 0:
                     arb, profit, pairs, _ = check_arbitrage(m, balance, positions)
@@ -586,13 +620,17 @@ def run():
                 # Check late-game opportunity
                 if balance:
                     should_trade, side, confidence = check_late_game(m, balance, positions)
-                    if should_trade and confidence >= 0.6:  # Lower threshold for more opportunities
+                    if should_trade and confidence >= 0.5:  # Lower threshold for more opportunities
                         execute_late_game(m, side, confidence, balance, positions)
                         late_taken += 1
                         late_count += 1
                         trades_today += 1
             
-            print(f"[{ts}] Done. Today's: {trades_today} trades (arb: {arb_count}, late: {late_count})")
+            # Get actual trade count from API
+            api_trades = get_trade_history_today()
+            api_str = f" | API orders: {api_trades}" if api_trades is not None else ""
+            
+            print(f"[{ts}] Done. Today's: {trades_today} trades (arb: {arb_count}, late: {late_count}){api_str}")
             
             # Show updated performance every hour
             if int(time.time()) % 3600 < 45:

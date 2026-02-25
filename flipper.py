@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-GoobClaw Flipper v2 — OBI-enhanced ratchet scalper
-Uses Order Book Imbalance to pick direction, -2c stop/flip, +3c target.
-Also sweeps all markets closing in next 2 min (not just ETH/BTC).
+GoobClaw Flipper v3 — Swing Trader
+Strategy: Buy dips, sell rips, hold below 67, quick exits above 67.
+Target: +10c per swing, never sell at loss.
 """
 
 import os
@@ -16,21 +16,21 @@ from kalshi_connection import get_kalshi_headers
 
 load_dotenv()
 
-BASE_URL          = "https://api.elections.kalshi.com"
-COINGECKO_URL     = "https://api.coingecko.com/api/v3/simple/price"
-STOP_LOSS_CENTS   = 3    # tighter stop
-TAKE_PROFIT_CENTS = 4    # higher target to cover spread
-MAX_ENTRY_PRICE   = 55   # stricter entry price
-MIN_SECS_LEFT     = 300  # NEVER enter with less than 5 min left
-MAX_SECS_LEFT     = 840  # flipper entry: up to 14 min before close
-MAX_FLIPS         = 1    # max 1 flip — reversal is usually wrong
-MIN_OBIT_TO_FLIP  = 0.15 # require stronger OBI to flip
-MIN_GAP_TO_FLIP   = 3    # require 3¢ gap to consider flip
-CONTRACTS         = 1
-FORCE_ENTRY_PRICE = 55   # if either side is <= this with no signal, enter anyway
-AUTO_TRADE        = os.getenv("AUTO_TRADE", "true").lower() == "true"
-TELEGRAM_TOKEN    = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
-JASON_CHAT_ID     = "7478453115"
+BASE_URL = "https://api.elections.kalshi.com"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+# === FLIPPER V3 PARAMETERS ===
+SWING_TARGET = 10      # Capture 10c per swing
+MIN_ENTRY_PRICE = 20  # Enter on dips below 20
+MAX_ENTRY_PRICE = 80  # Enter on dips below 80
+RISK_THRESHOLD = 67   # Above this: trade actively | Below this: hold to settlement
+MIN_SECS_LEFT = 300   # Never enter with <5 min left
+MAX_SECS_LEFT = 840   # Up to 14 min before close
+MAX_SPREAD = 4        # Skip illiquid markets
+FIXED_CONTRACTS = 1   # Fixed size (set to 0 to enable auto-scale)
+AUTO_TRADE = os.getenv("AUTO_TRADE", "true").lower() == "true"
+TELEGRAM_TOKEN = "8327315190:AAGBDny1KAk9m27YOCGmxD2ElQofliyGdLI"
+JASON_CHAT_ID = "7478453115"
 
 COIN_MAP = {"KXBTC15M": "bitcoin", "KXETH15M": "ethereum"}
 
@@ -58,25 +58,38 @@ def get_balance():
     path = "/trade-api/v2/portfolio/balance"
     try:
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        print(f"  🌐 GET {path} → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
         if res.status_code == 200:
             return res.json().get("balance", 0) / 100
-    except:
-        pass
+    except Exception as e:
+        print(f"  🌐 GET {path} → ⚠️ {e}")
     return None
+
+
+def get_contracts(balance, entry_price):
+    """Auto-scale contracts based on bankroll. Returns 1 if FIXED_CONTRACTS > 0."""
+    if FIXED_CONTRACTS > 0:
+        return FIXED_CONTRACTS
+    
+    # Auto-scale: 1 contract per ~$0.50 of bankroll, max 10
+    if balance and entry_price > 0:
+        contracts = int(balance / 0.50)
+        contracts = max(1, min(contracts, 10))
+        return contracts
+    return 1
 
 
 def get_markets_closing_soon(within_secs=780):
     """Get all open markets closing within N seconds."""
     now = datetime.now(timezone.utc)
-    max_close = (now + timedelta(seconds=within_secs)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    min_close = (now + timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
     path = f"/trade-api/v2/markets?status=open&min_close_ts={int(now.timestamp()+10)}&max_close_ts={int((now + timedelta(seconds=within_secs)).timestamp())}&limit=50"
     try:
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=10)
+        print(f"  🌐 GET markets → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
         if res.status_code == 200:
             return res.json().get("markets", [])
-    except:
-        pass
+    except Exception as e:
+        print(f"  🌐 GET markets → ⚠️ {e}")
     return []
 
 
@@ -86,27 +99,11 @@ def get_orderbook(ticker):
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=8)
         if res.status_code == 200:
             return res.json().get("orderbook", {})
-    except:
-        pass
+        else:
+            print(f"  🌐 GET {ticker} orderbook → {res.status_code}")
+    except Exception as e:
+        print(f"  🌐 GET {ticker} orderbook → ⚠️ {e}")
     return {}
-
-
-def calculate_obi(orderbook, depth=5):
-    """Order Book Imbalance. Positive = YES-heavy (buy YES). Negative = NO-heavy (buy NO)."""
-    yes_bids = orderbook.get("yes") or []
-    no_bids  = orderbook.get("no")  or []
-
-    def get_vol(bids):
-        if not bids:
-            return 0
-        best = bids[-1][0]
-        return sum(vol for price, vol in bids if price >= best - depth)
-
-    v_yes = get_vol(yes_bids)
-    v_no  = get_vol(no_bids)
-    if v_yes + v_no == 0:
-        return 0
-    return (v_yes - v_no) / (v_yes + v_no)
 
 
 def get_live_price(coin_id):
@@ -123,45 +120,52 @@ def get_live_price(coin_id):
     return None
 
 
-def pick_side(market, orderbook):
+def calculate_obi(orderbook, depth=5):
+    """Order Book Imbalance. Positive = YES-heavy, Negative = NO-heavy."""
+    yes_bids = orderbook.get("yes") or []
+    no_bids = orderbook.get("no") or []
+
+    def get_vol(bids):
+        if not bids:
+            return 0
+        best = bids[-1][0]
+        return sum(vol for price, vol in bids if price >= best - depth)
+
+    v_yes = get_vol(yes_bids)
+    v_no = get_vol(no_bids)
+    if v_yes + v_no == 0:
+        return 0
+    return (v_yes - v_no) / (v_yes + v_no)
+
+
+def should_enter(market, orderbook):
     """
-    Pick YES or NO using OBI as primary signal.
-    Falls back to floor_strike vs live price for BTC/ETH markets.
-    Returns (side, entry_price_cents, confidence_str)
+    Enter on dips — price below threshold.
     """
-    obi = calculate_obi(orderbook)
-    series = market["ticker"].split("-")[0]
-
-    # OBI signal — only use if the selected side is affordable
-    if abs(obi) >= 0.10:
-        side = "yes" if obi > 0 else "no"
-        price = market.get("yes_ask" if side == "yes" else "no_ask", 50)
-        if price <= MAX_ENTRY_PRICE:
-            return side, price, f"OBI={obi:+.2f}"
-        # OBI side too expensive — fall through to other checks
-
-    # Fallback: CoinGecko for crypto markets
-    coin = COIN_MAP.get(series)
-    if coin:
-        live = get_live_price(coin)
-        floor = market.get("floor_strike", 0)
-        if live and floor:
-            edge_pct = (live - floor) / floor * 100
-            if abs(edge_pct) >= 0.05:
-                side = "yes" if live >= floor else "no"
-                price = market.get("yes_ask" if side == "yes" else "no_ask", 50)
-                return side, price, f"price_edge={edge_pct:+.2f}%"
-
-    # Force entry: if price is near 50/50, pick the cheaper side
-    ya = market.get("yes_ask", 50)
-    na = market.get("no_ask", 50)
-    if ya <= FORCE_ENTRY_PRICE or na <= FORCE_ENTRY_PRICE:
-        if ya <= na:
-            return "yes", ya, f"forced(YES cheaper @ {ya}c)"
-        else:
-            return "no", na, f"forced(NO cheaper @ {na}c)"
-
-    return None, None, "no_signal"
+    ya = market.get("yes_ask", 0)
+    yb = market.get("yes_bid", 0)
+    na = market.get("no_ask", 0)
+    nb = market.get("no_bid", 0)
+    
+    # Skip decided markets
+    if ya >= 95 or na >= 95 or ya == 0 or na == 0:
+        return None, None, "decided"
+    
+    # Check spread
+    yes_spread = ya - yb if ya and yb else 999
+    no_spread = na - nb if na and nb else 999
+    if yes_spread > MAX_SPREAD or no_spread > MAX_SPREAD:
+        return None, None, "wide_spread"
+    
+    # Entry: Buy on dips (price below MAX_ENTRY_PRICE)
+    # Prefer YES below threshold (more upside)
+    if ya <= MAX_ENTRY_PRICE and ya >= MIN_ENTRY_PRICE:
+        return "yes", ya, f"dip_buy@{ya}c"
+    
+    if na <= MAX_ENTRY_PRICE and na >= MIN_ENTRY_PRICE:
+        return "no", na, f"dip_buy@{na}c"
+    
+    return None, None, "no_entry"
 
 
 def place_order(ticker, side, price_cents, count=1, action="buy"):
@@ -179,8 +183,10 @@ def place_order(ticker, side, price_cents, count=1, action="buy"):
     headers["Content-Type"] = "application/json"
     try:
         res = requests.post(BASE_URL + path, json=payload, headers=headers, timeout=10)
+        print(f"  🌐 POST {ticker} {side}@{price_cents}c → {res.status_code} {'✅' if res.status_code == 201 else '❌'}")
         return res.status_code == 201, res.text if res.status_code != 201 else "ok"
     except Exception as e:
+        print(f"  🌐 POST order → ⚠️ {e}")
         return False, str(e)
 
 
@@ -190,166 +196,130 @@ def refresh_market(ticker):
         res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=8)
         if res.status_code == 200:
             return res.json().get("market", {})
-    except:
-        pass
+        else:
+            print(f"  🌐 GET {ticker} → {res.status_code}")
+    except Exception as e:
+        print(f"  🌐 GET {ticker} → ⚠️ {e}")
     return {}
 
 
-def should_flip(market, current_side, current_obi):
-    """
-    SMARTER REVERSAL: Only flip if there's actual evidence the market reversed.
-    Returns (new_side, reason) or (None, None) if shouldn't flip.
-    """
-    new_side = "no" if current_side == "yes" else "yes"
-    
-    # Get fresh orderbook for BOTH sides
-    ob = get_orderbook(market["ticker"])
-    new_obi = calculate_obi(ob)
-    
-    # Check OBI reversal — require stronger signal
-    obi_reversed = (current_obi > 0 and new_obi < 0) or (current_obi < 0 and new_obi > 0)
-    obi_stronger = abs(new_obi) > abs(current_obi) + 0.05
-    
-    # Check price action
-    ya = market.get("yes_ask", 50)
-    yb = market.get("yes_bid", 50)
-    na = market.get("no_ask", 50)
-    nb = market.get("no_bid", 50)
-    
-    yes_mid = (ya + yb) / 2
-    no_mid = (na + nb) / 2
-    
-    # Price reversed significantly?
-    if current_side == "yes":
-        price_reversed = no_mid > yes_mid + MIN_GAP_TO_FLIP
-    else:
-        price_reversed = yes_mid > no_mid + MIN_GAP_TO_FLIP
-    
-    # Check spread on new side (don't flip into illiquidity)
-    new_spread = (na - nb) if new_side == "no" else (ya - yb)
-    if new_spread > 4:
-        return None, f"new_side_spread_too_wide({new_spread}c)"
-    
-    # Only flip if OBI strongly reversed AND price action confirms
-    if obi_reversed and (abs(new_obi) >= MIN_OBIT_TO_FLIP or price_reversed):
-        reason = f"OBI_reversal:{current_obi:+.2f}→{new_obi:+.2f}"
-        if price_reversed:
-            reason += f" price_confirm"
-        return new_side, reason
-    
-    return None, "no_confirmation"
-
-
 def trade_market(market):
-    """Enter and manage one market with SMARTER flip logic."""
+    """Swing trade — buy dips, sell rips, hold below threshold."""
     ticker = market["ticker"]
     ob = get_orderbook(ticker)
-    side, entry_price, signal = pick_side(market, ob)
+    side, entry_price, signal = should_enter(market, ob)
 
     if not side:
         return
-    if entry_price > MAX_ENTRY_PRICE:
-        print(f"  Skip {ticker}: {side.upper()} @ {entry_price}c too expensive")
-        return
-
+    
     sl = secs_left(market["close_time"])
     if sl is None or sl < MIN_SECS_LEFT:
-        print(f"  Skip {ticker}: only {sl:.0f}s left — too close to expiry")
+        print(f"  Skip {ticker}: {sl:.0f}s left — too close")
         return
 
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"\n[{ts}] 🎯 {ticker} | {side.upper()} @ {entry_price}c | {signal} | {sl:.0f}s left")
+    balance = get_balance()
+    contracts = get_contracts(balance, entry_price)
+    print(f"\n[{ts}] 🎯 {ticker} | {side.upper()} @ {entry_price}c | {signal} | {sl:.0f}s left | {contracts} contract(s)")
 
     if AUTO_TRADE:
-        ok, err = place_order(ticker, side, entry_price, CONTRACTS)
+        ok, err = place_order(ticker, side, entry_price, contracts)
         if not ok:
             print(f"  ❌ Entry failed: {err}")
             return
 
-    tg(f"🎯 *Flipper entered* `{ticker}`\n{side.upper()} @ {entry_price}c | {signal} | {sl:.0f}s left")
+    tg(f"🎯 *Swing enter* `{ticker}` {side.upper()}@{entry_price}c ({contracts}x) | {signal}")
 
     entry = entry_price
-    current_obi = calculate_obi(ob)
-    total_loss = 0
-    flips = 0
+    bought = False  # Track if we entered
 
     while True:
         time.sleep(4)
+        ob = get_orderbook(ticker)
         m = refresh_market(ticker)
-        if not m:
+        
+        if not m or not ob:
             break
 
         sl = secs_left(m.get("close_time", ""))
         if sl is not None and sl <= 0:
-            print(f"  ⏰ {ticker} expired. Flips: {flips}, base loss: {total_loss}c")
-            tg(f"⏰ `{ticker}` expired | Flips: {flips} | Base loss: {total_loss}c")
+            print(f"  ⏰ {ticker} expired. Entry: {entry}c")
+            tg(f"⏰ `{ticker}` expired | Entry: {entry}c")
             break
 
-        bid = m.get("yes_bid" if side == "yes" else "no_bid", 0)
-        pnl = bid - entry
-        ts  = datetime.now().strftime("%H:%M:%S")
+        # Get current bid from market data (more reliable than orderbook)
+        current_bid = m.get("yes_bid" if side == "yes" else "no_bid", 0)
+        
+        # Debug: check if market bid is reasonable
+        if current_bid < 5 or current_bid > 99:
+            print(f"  ⚠️ Market bid {current_bid}c weird, trying orderbook...")
+            # Fallback to orderbook
+            if side == "yes":
+                yes_data = ob.get("yes", [])
+                current_bid = yes_data[0][0] if yes_data and yes_data[0][0] > 5 else 0
+            else:
+                no_data = ob.get("no", [])
+                current_bid = no_data[0][0] if no_data and no_data[0][0] > 5 else 0
+            print(f"  ↳ Orderbook bid: {current_bid}c")
+        
+        if current_bid <= 0:
+            continue
+        
+        pnl = current_bid - entry
+        ts = datetime.now().strftime("%H:%M:%S")
 
-        if pnl >= TAKE_PROFIT_CENTS:
-            print(f"  [{ts}] 💰 Take profit +{pnl}c | sell {side.upper()} @ {bid}c")
+        # Check if we got filled (first time seeing valid bid after entry)
+        if not bought and current_bid > 0:
+            bought = True
+            print(f"  ✅ Filled at {current_bid}c")
+
+        # === EXIT LOGIC ===
+        
+        # 1. Take profit: +10c or more
+        if pnl >= SWING_TARGET:
+            print(f"  [{ts}] 💰 Target hit +{pnl}c | sell @ {current_bid}c")
             if AUTO_TRADE:
-                place_order(ticker, side, bid, CONTRACTS, action="sell")
-            net = pnl - total_loss
-            tg(f"💰 *Profit!* `{ticker}` +{pnl}c this leg | Net: {net:+}c")
+                place_order(ticker, side, current_bid, contracts, action="sell")
+            net = pnl
+            tg(f"💰 *Swing win* `{ticker}` +{pnl}c")
             break
 
-        if pnl <= -STOP_LOSS_CENTS:
-            loss = entry - bid
-            total_loss += loss
-            flips += 1
-
-            # Bail after max flips — cut losses
-            if flips > MAX_FLIPS:
-                print(f"  [{ts}] 🛑 Max flips hit — exiting. Total loss: {total_loss}c")
+        # 2. Near expiry: take whatever we can (but not at loss)
+        if sl is not None and sl < 60:
+            if pnl > 0:
+                print(f"  [{ts}] ⏰ Near expiry +{pnl}c | exit @ {current_bid}c")
                 if AUTO_TRADE:
-                    place_order(ticker, side, bid, CONTRACTS, action="sell")
-                tg(f"🛑 Max flips on `{ticker}` | Exiting | Total loss: {total_loss}c")
-                break
+                    place_order(ticker, side, current_bid, contracts, action="sell")
+                tg(f"⏰ *Near expiry* `{ticker}` +{pnl}c")
+            else:
+                print(f"  [{ts}] ⏰ Near expiry {pnl}c | holding to settle")
+            break
 
-            # SMARTER REVERSAL: Check if reversal is actually confirmed
-            new_side, flip_reason = should_flip(m, side, current_obi)
-            
-            if new_side is None:
-                print(f"  [{ts}] 🛑 Stop -{loss}c | No reversal confirmation ({flip_reason})")
-                if AUTO_TRADE:
-                    place_order(ticker, side, bid, CONTRACTS, action="sell")
-                tg(f"🛑 *Flipper stop* `{ticker}` -{loss}c | No flip: {flip_reason}")
-                break
-            
-            new_price = m.get("yes_ask" if new_side == "yes" else "no_ask", 50)
-
-            print(f"  [{ts}] 🔄 Flip #{flips} | -{loss}c | → {new_side.upper()} @ {new_price}c | reason: {flip_reason}")
-
+        # 3. Above threshold: if price riped, take quick profit
+        if current_bid > RISK_THRESHOLD and pnl > 0:
+            print(f"  [{ts}] 💹 Above {RISK_THRESHOLD}c, taking +{pnl}c")
             if AUTO_TRADE:
-                place_order(ticker, side, bid, CONTRACTS, action="sell")
-                time.sleep(1)
-                ok, err = place_order(ticker, new_side, new_price, CONTRACTS)
-                if not ok:
-                    print(f"  ❌ Flip failed: {err}")
-                    tg(f"❌ Flip failed `{ticker}`: {err}")
-                    break
+                place_order(ticker, side, current_bid, contracts, action="sell")
+            tg(f"💹 *Above threshold* `{ticker}` +{pnl}c")
+            break
 
-            tg(f"🔄 *Flip #{flips}* `{ticker}` | -{loss}c | → {new_side.upper()} @ {new_price}c | {flip_reason}")
-            side = new_side
-            entry = new_price
-            current_obi = calculate_obi(get_orderbook(ticker))
-        else:
-            if int(time.time()) % 20 == 0:
-                print(f"  [{ts}] {side.upper()} {pnl:+}c | {sl:.0f}s left | OBI: {current_obi:+.2f}")
+        # 4. Never sell at loss — hold to settlement
+        # (just keep holding)
+
+        # Status heartbeat
+        if int(time.time()) % 20 == 0:
+            status = "HOLD" if pnl <= 0 else f"+{pnl}c"
+            print(f"  [{ts}] {side.upper()} {status} | {sl:.0f}s left | bid={current_bid}c")
 
 
 def run():
     print("=" * 60)
-    print("  GoobClaw Flipper v2 — OBI + Ratchet")
-    print(f"  Stop: -{STOP_LOSS_CENTS}c | Target: +{TAKE_PROFIT_CENTS}c")
-    print(f"  Sweeps ALL markets closing in <{MAX_SECS_LEFT//60} min")
+    print("  GoobClaw Flipper v3 — Swing Trader")
+    print(f"  Target: +{SWING_TARGET}c | Entry: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}c")
+    print(f"  Threshold: {RISK_THRESHOLD}c (above=exit, below=hold)")
     print(f"  Auto-trade: {AUTO_TRADE}")
     print("=" * 60)
-    tg("🦞 *Flipper v2 online* — OBI signal + sweeping all closing-soon markets")
+    tg("🦞 *Flipper v3 online* — swing trading")
 
     traded = set()
 
@@ -357,24 +327,25 @@ def run():
         try:
             ts = datetime.now().strftime("%H:%M:%S")
 
-            # Always check BTC/ETH 15-min directly first
+            # Priority markets - all 15M series
             priority_markets = []
-            for series in ["KXBTC15M", "KXETH15M"]:
-                path = f"/trade-api/v2/markets?series_ticker={series}&status=open&limit=1"
+            for series in ["KXBTC15M", "KXETH15M", "KXXRP15M", "KXSOL15M", "KXADA15M", "KXAVAX15M", "KXDOGE15M", "KXLTC15M"]:
+                path = f"/trade-api/v2/markets?series_ticker={series}&status=open&limit=5"
                 try:
                     res = requests.get(BASE_URL + path, headers=get_kalshi_headers("GET", path), timeout=8)
+                    print(f"  🌐 GET {series} → {res.status_code} {'✅' if res.status_code == 200 else '❌'}")
                     if res.status_code == 200:
                         ms = res.json().get("markets", [])
                         if ms:
                             priority_markets.append(ms[0])
-                except:
-                    pass
+                except Exception as e:
+                    print(f"  🌐 GET {series} → ⚠️ {e}")
 
-            # Also sweep other closing-soon markets
+            # Sweep closing-soon markets
             sweep = get_markets_closing_soon(MAX_SECS_LEFT)
             all_markets = {m["ticker"]: m for m in priority_markets + sweep}.values()
 
-            print(f"[{ts}] Scanning {len(list(all_markets))} markets...")
+            print(f"[{ts}] 📡 Scanning {len(list(all_markets))} markets (priority: {len(priority_markets)}, sweep: {len(sweep)})...")
             all_markets = {m["ticker"]: m for m in priority_markets + sweep}.values()
 
             for m in all_markets:
@@ -387,19 +358,28 @@ def run():
 
                 ya = m.get("yes_ask", 0)
                 na = m.get("no_ask", 0)
+                yb = m.get("yes_bid", 0)
+                nb = m.get("no_bid", 0)
 
-                # Skip markets already decided — both sides should be live
+                # Skip decided
                 if ya >= 95 or na >= 95 or ya == 0 or na == 0:
                     continue
-                # Skip if neither side is a reasonable entry
-                if min(ya, na) > MAX_ENTRY_PRICE:
+                
+                # Skip wide spreads
+                yes_spread = ya - yb if ya and yb else 999
+                no_spread = na - nb if na and nb else 999
+                if yes_spread > MAX_SPREAD or no_spread > MAX_SPREAD:
                     continue
 
-                # Mark as seen so we don't double-enter
+                # Skip if no entry opportunity
+                if ya > MAX_ENTRY_PRICE and na > MAX_ENTRY_PRICE:
+                    continue
+                if ya < MIN_ENTRY_PRICE and na < MIN_ENTRY_PRICE:
+                    continue
+
                 traded.add(ticker)
                 trade_market(m)
 
-            # Clean old tickers from traded set every cycle
             if len(traded) > 200:
                 traded.clear()
 
